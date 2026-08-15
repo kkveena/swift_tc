@@ -66,6 +66,19 @@ class TestPromptFile:
         assert NO_TOWN in prompt_contract.text
         assert NO_COUNTRY in prompt_contract.text
 
+    def test_prompt_has_greenwich_new_york_regression_example(self, prompt_contract):
+        text = prompt_contract.text
+        assert "88 GREENWICH STREET NEW YORK NY 10013-2632 US" in text
+        assert '"town":"NEW YORK"' in text
+        assert '"country_candidates":["US"]' in text
+
+    def test_prompt_has_lima_postal_code_regression_example(self, prompt_contract):
+        text = prompt_contract.text
+        assert "441-445 JIRON SANTA ROSA LIMA METRO MUNIC OF LIMA 15001" in text
+        assert '"town":"LIMA"' in text
+        assert '"country_candidates":["PE"]' in text
+        assert '"country_is_explicit":false' in text
+
     def test_missing_prompt_file_is_reported(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             load_prompt_contract(tmp_path / "absent.md", "v1")

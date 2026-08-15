@@ -368,7 +368,7 @@ class TestPipelineIntegration:
         town_country = result.metrics["reference_data"]["town_country"]
         assert town_country["loaded"] is True
         assert town_country["approved_for_production"] is False
-        assert town_country["ambiguity_policy"] == "escalate"
+        assert town_country["ambiguity_policy"] == "annotate"
         assert result.metrics["outcomes"]["reference_status_counts"]
 
         entry = next(iter(result.audit.values()))

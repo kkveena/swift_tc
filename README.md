@@ -448,11 +448,12 @@ plus documentation rather than an assumption buried in code.
     5. a town absent from the reference is `reference_not_found` — a reference miss, never an
        extraction error.
 
-    **This changes one documented sample outcome.** `LIMA` (Peru and Lima, Ohio) has no explicit
-    country in its address, so it escalates from `PE` at 0.349125 to `PE,US` at 0.0 and mandatory
-    HITL. Explicitly stated countries are unaffected: `BOSTON … US` stays `US` at 0.9702 even though
-    Boston also exists in the UK. Set `town_country_ambiguity_policy: annotate` to keep the model's
-    single inferred country and record the reference finding in the audit trail only.
+   **The shipped runtime configuration uses `annotate`.** The development Town/Country reference is
+   corroborative only, so `LIMA` with a defensible model inference of `PE` stays `PE`; the presence
+   of Lima, Ohio is recorded in the audit trail and metrics. Use
+   `town_country_ambiguity_policy: escalate` only when multi-country reference findings must force
+   `PE,US`, a `0.0` composite score, and mandatory HITL. Explicitly stated countries always retain
+   precedence in either mode.
 17. **Reference findings are audit data, not CSV columns.** `reference_status` and the candidate set
     live in the audit payload and `run_metrics.json`; the production schema stays at 12 fields.
 18. **Logs reference addresses by SHA-256**, never in plaintext, unless

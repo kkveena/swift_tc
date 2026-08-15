@@ -8,7 +8,7 @@
 # only (see `.env.example`).
 
 project:
-  prompt_version: "v2-composite-weighted"
+  prompt_version: "v6-lima-postal-inference"
   record_id_column: "RECORD_ID"
   # [EXTENSION] Path to the Gemini prompt contract. Loaded from exactly one
   # place so the prompt is never duplicated across modules.
@@ -133,13 +133,12 @@ reference_data:
   town_country_max_candidates: 0
   # How a town name that maps to several countries affects the result:
   #   escalate - preserve every candidate, force country probability/weight and
-  #              the composite score to 0.0, and mandate HITL (default).
+  #              the composite score to 0.0, and mandate HITL.
   #   annotate - leave the prediction untouched and record the reference finding
   #              in the audit trail and metrics only.
-  # `escalate` only fires when the address carries NO explicit country evidence;
-  # an explicitly stated country always wins and is merely checked for
-  # consistency. See README "Implementation decisions".
-  town_country_ambiguity_policy: "escalate"
+  # Production runs use annotate: the development reference is corroborative
+  # evidence, not an override of a defensible model inference from the address.
+  town_country_ambiguity_policy: "annotate"
 
 reporting:
   enabled: true
