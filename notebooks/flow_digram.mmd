@@ -1,0 +1,41 @@
+---
+references:
+  - "File: /tests/test_prompt_contract.py"
+  - "File: /tests/test_town_country_reference.py"
+generationTime: 2026-08-15T20:00:24.201Z
+---
+flowchart TD
+    Start("Pytest runs contract and reference tests")
+
+    Start --> LoadPrompt[["load_prompt_contract()"]]
+    LoadPrompt --> PromptAvailable{"Prompt file available?"}
+    PromptAvailable -->|No| ExpectedError("Expected missing or malformed-input error")
+    PromptAvailable -->|Yes| ContractChecks["Assert prompt fields, sentinels, anti-substring rule, schema, payload, and regression examples"]
+    ContractChecks -.->|iterate| ContractChecks
+    ContractChecks --> BuildPayload[["build_user_payload()"]]
+    BuildPayload --> ParseResponse[["parse_extraction_response()"]]
+    ParseResponse --> ResponseValid{"Valid JSON object with required fields?"}
+    ResponseValid -->|No| ExpectedError
+    ResponseValid -->|Yes| NormalizedResponse["Normalized ExtractionResponse with uppercase town and distinct alpha-2 candidates"]
+
+    Start --> ReferenceEnabled{"town_country_enabled?"}
+    ReferenceEnabled -->|No| VerifyExtraction[["verify_extraction()"]]
+    ReferenceEnabled -->|Yes| ResolveFile[["resolve_town_country_file()"]]
+    ResolveFile --> ReferenceAvailable{"Reference file available and headers mappable?"}
+    ReferenceAvailable -->|No| ExpectedError
+    ReferenceAvailable -->|Yes| ReferenceFile[("Town-country fixture or CSV")]
+    ReferenceFile --> BuildProvider[["build_town_country_provider() and TownCountryProvider.from_file()"]]
+    BuildProvider ==> VerifyExtraction
+    NormalizedResponse ==> VerifyExtraction
+
+    VerifyExtraction --> TownAvailable{"Predicted town available?"}
+    TownAvailable -->|No| NoTownStatus["Set REFERENCE_NO_TOWN and skip lookup"]
+    NoTownStatus --> Evaluate[["evaluate() produces scenario, weighted score, and HITL decision"]]
+
+    TownAvailable -->|Yes| LookupCountryCodes[["lookup_country_codes()"]]
+    LookupCountryCodes --> ReferenceRelationship{"Reference relationship and ambiguity policy?"}
+    ReferenceRelationship -->|Consistent| Evaluate
+    ReferenceRelationship -->|Supplied| Evaluate
+    ReferenceRelationship -->|NotFound| Evaluate
+    ReferenceRelationship -->|Multi| Evaluate
+    ReferenceRelationship -->|Conflict| Evaluate
