@@ -10,11 +10,13 @@ io              CSV read/write, error sidecar, run metrics
 grouping        group config loading/validation, combined-address construction
 cleaning        deterministic normalization and token-boundary matching
 schemas         Gemini structured-response schema and validation
-reference_data  ReferenceDataProvider abstraction (null / ISO 3166 / SWIFTRef)
+reference_data  ReferenceDataProvider abstraction (null / ISO 3166 / Town-Country
+                / SWIFTRef stub)
 gemini_client   extraction client protocol, Gemini implementation, mock client
 scoring         verified scenario selection, reliability weights, composite score
 cache           stable cache key + JSONL result cache
 pipeline        Pass 1 / Pass 2 orchestration
+reporting       executive KPIs, score distribution, HITL threshold sensitivity
 """
 
 __version__ = "1.0.0"
@@ -27,6 +29,7 @@ __all__ = [
     "io",
     "pipeline",
     "reference_data",
+    "reporting",
     "schemas",
     "scoring",
     "settings",

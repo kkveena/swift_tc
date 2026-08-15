@@ -30,6 +30,14 @@ from .schemas import NO_COUNTRY, NO_TOWN, ExtractionResponse
 __all__ = [
     "AMBIGUOUS_TOWN_INFERRED_SCENARIO",
     "NULL_SKIP_SCENARIO",
+    "REFERENCE_CONFLICT",
+    "REFERENCE_CONSISTENT",
+    "REFERENCE_MULTI_ANNOTATED",
+    "REFERENCE_MULTI_ESCALATED",
+    "REFERENCE_NOT_CHECKED",
+    "REFERENCE_NOT_FOUND",
+    "REFERENCE_NO_TOWN",
+    "REFERENCE_SUPPLIED",
     "REQUIRED_SCENARIOS",
     "ScoreResult",
     "VerifiedExtraction",
@@ -65,6 +73,18 @@ AMBIGUOUS_TOWN_INFERRED_SCENARIO = "town_inferred_country_ambiguous"
 NULL_SKIP_SCENARIO = "null_skip"
 
 
+#: Outcomes of the Town/Country reference check. Audit/metrics only — none of
+#: these become production CSV columns.
+REFERENCE_NOT_CHECKED = "not_checked"
+REFERENCE_NO_TOWN = "no_town_predicted"
+REFERENCE_NOT_FOUND = "reference_not_found"
+REFERENCE_CONSISTENT = "consistent"
+REFERENCE_SUPPLIED = "supplied_by_reference"
+REFERENCE_MULTI_ESCALATED = "multi_country_escalated"
+REFERENCE_MULTI_ANNOTATED = "multi_country_annotated"
+REFERENCE_CONFLICT = "conflict"
+
+
 @dataclass(frozen=True)
 class VerifiedExtraction:
     """A model response after Python-side verification and normalization.
@@ -82,8 +102,11 @@ class VerifiedExtraction:
     country_ambiguous: bool
     town_probability: float
     country_probability: float
+    country_name_value: str = NO_COUNTRY
     rationale_town: str = ""
     rationale_country: str = ""
+    reference_status: str = REFERENCE_NOT_CHECKED
+    reference_codes: tuple[str, ...] = field(default_factory=tuple)
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -93,6 +116,10 @@ class VerifiedExtraction:
     @property
     def has_country(self) -> bool:
         return bool(self.country_candidates)
+
+    @property
+    def reference_conflict(self) -> bool:
+        return self.reference_status == REFERENCE_CONFLICT
 
 
 @dataclass(frozen=True)
@@ -128,9 +155,12 @@ def verify_extraction(
     cleaned_address: str,
     *,
     iso_provider: Iso3166Provider | None = None,
+    town_country_provider: Any = None,
     separator: str = ",",
     candidate_sort: str = "alphabetical",
     ambiguous_country_probability_override: float = 0.0,
+    town_country_ambiguity_policy: str = "escalate",
+    town_country_max_candidates: int = 0,
 ) -> VerifiedExtraction:
     """Verify a model response against the address text it was derived from.
 
@@ -141,7 +171,15 @@ def verify_extraction(
     3. verify each candidate country via ISO code or approved name alias;
     4. if several candidates remain but exactly one is explicitly present in
        the text, the text has resolved the ambiguity — collapse to it;
-    5. order the survivors deterministically and derive the final probabilities.
+    5. cross-check the predicted town against the Town/Country reference;
+    6. order the survivors deterministically, expand the country names from the
+       ISO layer, and derive the final probabilities.
+
+    Step 5 is a *validation* signal, never a silent rewrite. Explicit country
+    evidence in the address always wins; the reference can only confirm it,
+    flag a conflict, fill a gap the model left empty, or — when the address
+    carries no explicit country at all and the town genuinely spans several
+    countries — escalate the result to unresolved ambiguity.
     """
     notes: list[str] = []
 
@@ -175,10 +213,30 @@ def verify_extraction(
         notes.append(f"ambiguity_resolved_by_explicit_text_evidence:{present[0]}")
         candidates = list(present)
 
-    # 5. Ordering and finalization -------------------------------------------
+    # 5. Town/Country reference cross-check -----------------------------------
+    reference_status = REFERENCE_NOT_CHECKED
+    reference_codes: tuple[str, ...] = ()
+    if town_country_provider is not None:
+        candidates, reference_status, reference_codes = _apply_town_country_reference(
+            town=town,
+            candidates=candidates,
+            present=present,
+            provider=town_country_provider,
+            policy=town_country_ambiguity_policy,
+            notes=notes,
+        )
+
+    # 6. Ordering, truncation, and finalization -------------------------------
     ordered = _order_candidates(candidates, candidate_sort)
+    if town_country_max_candidates and len(ordered) > town_country_max_candidates:
+        notes.append(
+            f"country_candidates_truncated:{len(ordered)}->{town_country_max_candidates}"
+        )
+        ordered = ordered[:town_country_max_candidates]
+
     ambiguous = len(ordered) > 1
     country_value = separator.join(ordered) if ordered else NO_COUNTRY
+    country_name_value = _expand_country_names(ordered, iso_provider, separator)
 
     country_exists = bool(len(ordered) == 1 and ordered[0] in present)
 
@@ -197,6 +255,7 @@ def verify_extraction(
         town=town,
         country_candidates=ordered,
         country_value=country_value,
+        country_name_value=country_name_value,
         town_exists=town_exists,
         country_exists=country_exists,
         country_ambiguous=ambiguous,
@@ -204,8 +263,97 @@ def verify_extraction(
         country_probability=country_probability,
         rationale_town=response.town_rationale,
         rationale_country=response.country_rationale,
+        reference_status=reference_status,
+        reference_codes=reference_codes,
         notes=tuple(notes),
     )
+
+
+def _apply_town_country_reference(
+    *,
+    town: str,
+    candidates: list[str],
+    present: tuple[str, ...],
+    provider: Any,
+    policy: str,
+    notes: list[str],
+) -> tuple[list[str], str, tuple[str, ...]]:
+    """Cross-check the predicted town against the Town/Country reference.
+
+    Returns ``(candidates, status, reference_codes)``. The precedence order is
+    deliberate: explicit address evidence first, then a gap fill, then
+    escalation. A town missing from the reference is a reference miss, not an
+    extraction failure.
+    """
+    if town == NO_TOWN:
+        return candidates, REFERENCE_NO_TOWN, ()
+
+    reference_codes = tuple(provider.lookup_country_codes(town))
+
+    if not reference_codes:
+        notes.append("reference_not_found")
+        return candidates, REFERENCE_NOT_FOUND, ()
+
+    if present:
+        # The address states a country outright. That beats the reference; the
+        # reference only gets to agree or raise a flag.
+        unsupported = sorted(code for code in present if code not in reference_codes)
+        if unsupported:
+            notes.append("reference_conflict:" + "|".join(unsupported))
+            return candidates, REFERENCE_CONFLICT, reference_codes
+        return candidates, REFERENCE_CONSISTENT, reference_codes
+
+    if len(reference_codes) == 1:
+        single = reference_codes[0]
+        if not candidates:
+            # The model found no defensible country; the reference fills the gap.
+            # Country probability still comes from the model, so this surfaces a
+            # suggestion for review rather than manufacturing confidence.
+            notes.append(f"country_supplied_by_reference:{single}")
+            return [single], REFERENCE_SUPPLIED, reference_codes
+        if set(candidates) == {single}:
+            return candidates, REFERENCE_CONSISTENT, reference_codes
+        notes.append(
+            "reference_conflict:" + "|".join(sorted(set(candidates) - {single}))
+        )
+        return candidates, REFERENCE_CONFLICT, reference_codes
+
+    # Several reference countries and no explicit country evidence in the text.
+    if policy == "escalate":
+        merged = sorted(set(candidates) | set(reference_codes))
+        notes.append("reference_multi_country_escalated:" + "|".join(reference_codes))
+        return merged, REFERENCE_MULTI_ESCALATED, reference_codes
+
+    notes.append("reference_multi_country:" + "|".join(reference_codes))
+    return candidates, REFERENCE_MULTI_ANNOTATED, reference_codes
+
+
+def _expand_country_names(
+    codes: Sequence[str], iso_provider: Iso3166Provider | None, separator: str
+) -> str:
+    """Deterministically expand ISO codes to country names, one for one.
+
+    The name string always has exactly as many elements as the code string, in
+    the same order, so downstream consumers can split both on the separator and
+    zip them. Any separator character occurring *inside* a country name is
+    folded to a space first — several ISO short names are inverted forms such as
+    "Taiwan, Province of China", and one of those would otherwise silently add a
+    phantom element and break the alignment contract. Without an ISO provider
+    the codes stand in for their own names rather than the column going blank.
+    """
+    if not codes:
+        return NO_COUNTRY
+    if iso_provider is None:
+        return separator.join(codes)
+    return separator.join(
+        _strip_separator(name, separator) for name in iso_provider.country_names(codes)
+    )
+
+
+def _strip_separator(name: str, separator: str) -> str:
+    if separator and separator in name:
+        return " ".join(name.replace(separator, " ").split())
+    return name
 
 
 def select_scenario(
@@ -268,6 +416,10 @@ def score(
     needs_hitl = composite < float(scoring_config.hitl_threshold)
     if verified.country_ambiguous and scoring_config.force_ambiguous_country_to_hitl:
         needs_hitl = True
+    if verified.reference_conflict:
+        # The model and the deterministic reference disagree. Neither is
+        # overwritten; a human decides.
+        needs_hitl = True
 
     return ScoreResult(
         scenario=scenario,
@@ -288,19 +440,25 @@ def evaluate(
     scoring_config: Any,
     *,
     iso_provider: Iso3166Provider | None = None,
+    town_country_provider: Any = None,
     separator: str = ",",
     candidate_sort: str = "alphabetical",
+    town_country_ambiguity_policy: str = "escalate",
+    town_country_max_candidates: int = 0,
 ) -> tuple[VerifiedExtraction, ScoreResult]:
     """Verify then score a single model response."""
     verified = verify_extraction(
         response,
         cleaned_address,
         iso_provider=iso_provider,
+        town_country_provider=town_country_provider,
         separator=separator,
         candidate_sort=candidate_sort,
         ambiguous_country_probability_override=float(
             scoring_config.ambiguous_country_probability_override
         ),
+        town_country_ambiguity_policy=town_country_ambiguity_policy,
+        town_country_max_candidates=town_country_max_candidates,
     )
     return verified, score(verified, scoring_config)
 
@@ -315,6 +473,7 @@ def null_result() -> tuple[VerifiedExtraction, ScoreResult]:
         town=NO_TOWN,
         country_candidates=(),
         country_value=NO_COUNTRY,
+        country_name_value=NO_COUNTRY,
         town_exists=False,
         country_exists=False,
         country_ambiguous=False,
@@ -349,6 +508,7 @@ def error_result(reason: str) -> tuple[VerifiedExtraction, ScoreResult]:
         town=NO_TOWN,
         country_candidates=(),
         country_value=NO_COUNTRY,
+        country_name_value=NO_COUNTRY,
         town_exists=False,
         country_exists=False,
         country_ambiguous=False,

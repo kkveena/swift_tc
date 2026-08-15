@@ -10,6 +10,11 @@ This starter is intentionally notebook-first, but the implementation should plac
 1. The screenshots and source schema imply **50 input columns**: `RECORD_ID` + 16 address groups × 3 lines + `OTHER`.
 2. The screenshot group-config shows 15 groups. The input-schema screenshot includes one additional unmapped group: `PRI_SNDR_CORR_ADDR_LINE_1..3`. The sample configuration therefore keeps the screenshot mappings as groups 1–15 and adds `PRI_SNDR_CORR` as **group16**. This should be confirmed against the authoritative project config before production use.
 3. There are **11 requested output columns per group**. Therefore 16 × 11 = **176 appended columns**, and a 50-column input becomes **226 columns**, not 236. The code must calculate this dynamically and never hard-code 226.
+
+   > **Superseded — the arithmetic, not the principle.** `predicted_country_name_group_{id}` was
+   > added later, making it **12** fields per group: 16 × 12 = **192 appended columns** and
+   > **242** total for a 50-column input. The requirement that the count be *calculated* rather
+   > than hard-coded still holds and is enforced by `OUTPUT_FIELD_KEYS`.
 4. The user-supplied field names contained likely spelling typos (`comined`, `countrty`, `rational`). The new implementation should use canonical spellings (`combined`, `country`, `rationale`) by default. A naming-template config should make legacy names possible if downstream compatibility requires them.
 
 ## Phase 1 scope
@@ -35,15 +40,26 @@ For `group15`, the canonical names are:
 2. `combined_address_cleaned_group_15`
 3. `predicted_town_group_15`
 4. `predicted_country_group_15`
-5. `predicted_town_probability_group_15`
-6. `predicted_country_probability_group_15`
-7. `predicted_town_exists_group_15`
-8. `predicted_country_exists_group_15`
-9. `composite_weighted_score_group_15`
-10. `rationale_town_group_15`
-11. `rationale_country_group_15`
+5. `predicted_country_name_group_15`
+6. `predicted_town_probability_group_15`
+7. `predicted_country_probability_group_15`
+8. `predicted_town_exists_group_15`
+9. `predicted_country_exists_group_15`
+10. `composite_weighted_score_group_15`
+11. `rationale_town_group_15`
+12. `rationale_country_group_15`
 
 The same template is generated for every configured group. Do not hard-code group IDs.
+
+`predicted_country_name_*` is **deterministic reference-derived output**, not a second model
+prediction: Python expands `predicted_country_*` through the ISO 3166-1 layer. The two columns stay
+aligned element for element, so `CA,US` pairs with `Canada,United States`, a single code yields a
+single name, and `NO_COUNTRY` yields `NO_COUNTRY`. The response schema has no country-name field for
+the model to fill in.
+
+**12 fields per group** → 16 groups append 192 columns, and a 50-column input becomes **242**
+columns. As before, this is calculated from `OUTPUT_FIELD_KEYS` and the enabled group count; nothing
+in the code hard-codes it.
 
 ## Null-address first pass
 
@@ -151,6 +167,38 @@ The raw Gemini candidate-set confidence may be retained in cache/debug metadata,
 `composite_weighted_score_*` is the routing signal. Keep `hitl_threshold` configurable. Do not permanently choose a threshold based only on intuition. After collecting labeled data, measure auto-accepted precision/recall and calibrate the threshold to the required operational risk level.
 
 A suggested development default is `0.80`, but it is a placeholder only. Any unresolved multiple-country case is mandatory HITL regardless of threshold.
+
+### Provisional recommendation: 0.90
+
+`reporting.recommended_threshold` is **0.90** — a conservative Phase 1 starting point, and
+configuration rather than anything hard-coded in reporting logic. It is a **provisional routing
+policy, not calibrated accuracy.**
+
+The reasoning is structural, not tuned. Because the composite is a *product* of two weighted terms,
+each scenario has a hard ceiling reached only at perfect model confidence:
+
+| Scenario | Ceiling | Can clear 0.90? |
+|---|---:|---|
+| `both_explicit` | 1.0000 | yes |
+| `country_explicit_town_inferred` | 0.5000 | no |
+| `town_explicit_country_inferred` | 0.3750 | no |
+| `neither_explicit_both_inferred` | 0.0400 | no |
+| any ambiguous / no-defensible scenario | 0.0000 | no |
+
+So 0.90 is really a *shape* decision — "auto-accept only when Town and Country are both explicitly
+present in the address text and the model is highly confident" — and within `both_explicit` it
+requires roughly 0.95 on both confidences if the two are similar (`0.95 × 0.95 = 0.9025`). Note that
+between 0.3750 and 0.5000 the threshold makes no practical difference at all: no scenario produces
+scores there.
+
+**Choose the production threshold from labeled validation data.** Once labels exist, extend
+`threshold_sensitivity.csv` with precision of the auto-accepted population, its error rate, and
+recall/coverage, then apply the governance criterion: **select the lowest threshold that still meets
+the business-approved minimum precision** — optimize for precision at an accepted review cost, not
+for throughput.
+
+Ambiguity, extraction errors, and model/reference conflicts force HITL at every threshold, so the
+sensitivity table reports those forced counts separately from the score-driven ones.
 
 ## Token/cost controls
 
@@ -263,17 +311,66 @@ result = run_phase1("data/sample_input.csv", config, group_config,
 ### Tests
 
 ```bash
-python -m pytest          # 222 tests
+python -m pytest          # 325 tests
 ```
+
+Tests never read the real Town/Country reference file. `tests/conftest.py` repoints
+`reference_data.town_country_path` at `tests/fixtures/town_country_reference_test.csv` and redirects
+every output path into `tmp_path`, so the suite is hermetic and runs with no credentials, no network,
+and no large local data.
 
 ### Outputs
 
-| Path | Contents |
-|---|---|
-| `outputs/phase1_output.csv` | every input column unchanged + 11 columns per enabled group |
-| `outputs/processing_errors.csv` | one row per failed unique address; addresses referenced by hash |
-| `outputs/run_metrics.json` | shape, null-skip and dedupe savings, cache/call counts, scenario counts, HITL counts, reference-data provenance |
-| `outputs/address_cache.jsonl` | cached extractions + audit metadata (**contains raw addresses; git-ignored**) |
+Everything under `outputs/` is generated and git-ignored except `outputs/README.md`, which is
+tracked so a fresh clone gets the directory and its sensitivity warning. Every writer creates its
+parent directories, so deleting the tree is safe.
+
+| Path | Contents | Raw addresses |
+|---|---|---|
+| `outputs/phase1_output.csv` | every input column unchanged + 12 columns per enabled group | **Yes** |
+| `outputs/address_cache.jsonl` | cached extractions + audit metadata | **Yes** |
+| `outputs/processing_errors.csv` | one row per failed unique address, referenced by SHA-256 | No |
+| `outputs/run_metrics.json` | shape, savings, cache/call counts, scenario counts, HITL counts, reference-data provenance | No |
+| `outputs/reports/executive_summary.json` | headline KPIs for circulation | No |
+| `outputs/reports/score_distribution.csv` | composite-score bands over non-empty instances | No |
+| `outputs/reports/scenario_distribution.csv` | policy-scenario mix | No |
+| `outputs/reports/threshold_sensitivity.csv` | routing volume at each candidate threshold | No |
+| `outputs/charts/composite_score_histogram.png` | the score distribution as a chart | No |
+
+### Town/Country reference data (external runtime dependency)
+
+The Town/Country reference is **not part of this repository or any package built from it**. It is a
+large (~38 MB), environment-specific file read directly from its configured path:
+
+```yaml
+reference_data:
+  town_country_enabled: true
+  town_country_path: "data/reference/town_country_reference.csv"   # relative to repo root
+```
+
+Build a development copy — the script downloads from GeoNames and writes the expected schema:
+
+```bash
+python scripts/build_geonames_town_country_reference.py \
+  --output data/reference/town_country_reference.csv
+```
+
+GeoNames Gazetteer data is licensed **CC BY 4.0 and requires attribution**; preserve it wherever the
+derived file or its outputs are distributed. `data/reference/*.csv` is git-ignored, so the file never
+enters version control. Unit tests use the tiny committed fixture
+`tests/fixtures/town_country_reference_test.csv` instead, never the real file.
+
+If `town_country_enabled` is true and the file is missing, the pipeline **fails fast** with a message
+naming the builder script and the config keys. It does not fall back to web search or to the model's
+geographic knowledge.
+
+### Executive report
+
+`src/swift_address/reporting.py` builds the report; the notebook presents it. Three denominators are
+tracked separately and never mixed: **records**, **address-group instances** (split empty/non-empty),
+and **unique addresses**. The score distribution and threshold sensitivity both use *non-empty
+address-group instances*, since that is where review workload lands — empty instances are reported
+separately and never pad the histogram.
 
 ## Implementation decisions
 
@@ -330,7 +427,35 @@ plus documentation rather than an assumption buried in code.
 13. **Public web-search grounding is refused in code**, not merely defaulted off: constructing the
     Gemini client with grounding enabled raises. This data may contain customer and payment
     addresses.
-14. **Logs reference addresses by SHA-256**, never in plaintext, unless
+15. **Country Name is deterministic, never predicted.** It is expanded from `predicted_country_*`
+    through the ISO layer and stays aligned element for element. Two consequences worth knowing:
+    an unknown code expands to itself rather than to a blank cell, and any separator character
+    occurring *inside* a country name is folded to a space — several ISO short names are inverted
+    forms (`Taiwan, Province of China`), and one of those would otherwise add a phantom element and
+    silently break the alignment contract. `data/reference/iso3166.csv` now stores comma-free
+    display names, keeping the official inverted form as a matching alias.
+16. **The Town/Country reference validates; it does not overwrite.** Precedence is fixed and
+    deterministic:
+    1. explicit country evidence in the address always wins — the reference can only agree
+       (`consistent`) or disagree (`conflict`);
+    2. a `conflict` never replaces the model's value; it forces HITL and records the finding;
+    3. if the model returned no country at all, a single-country town fills the gap
+       (`supplied_by_reference`) with the model's own confidence, so it surfaces for review rather
+       than manufacturing certainty;
+    4. only when the address states **no** country explicitly *and* the town genuinely spans several
+       countries does `town_country_ambiguity_policy: escalate` (the default) preserve every
+       candidate and force the composite to `0.0`;
+    5. a town absent from the reference is `reference_not_found` — a reference miss, never an
+       extraction error.
+
+    **This changes one documented sample outcome.** `LIMA` (Peru and Lima, Ohio) has no explicit
+    country in its address, so it escalates from `PE` at 0.349125 to `PE,US` at 0.0 and mandatory
+    HITL. Explicitly stated countries are unaffected: `BOSTON … US` stays `US` at 0.9702 even though
+    Boston also exists in the UK. Set `town_country_ambiguity_policy: annotate` to keep the model's
+    single inferred country and record the reference finding in the audit trail only.
+17. **Reference findings are audit data, not CSV columns.** `reference_status` and the candidate set
+    live in the audit payload and `run_metrics.json`; the production schema stays at 12 fields.
+18. **Logs reference addresses by SHA-256**, never in plaintext, unless
     `SWIFT_ADDRESS_ALLOW_RAW_LOGS=true` is set in an approved debugging environment. The cache and
     the audit payload hold the raw text because they *are* the audit record; `outputs/` is
     git-ignored for that reason.
@@ -341,12 +466,15 @@ plus documentation rather than an assumption buried in code.
 config/config.yaml                     runtime config (loaded); config.example.yaml is the sample
 config/group_config.csv                16 groups x 3 lines; any N groups / N lines is supported
 data/reference/iso3166.csv             ISO 3166-1 development fallback (see PROVENANCE.md)
+data/reference/town_country_reference.csv   external runtime dependency; git-ignored, not bundled
+scripts/build_geonames_town_country_reference.py   builds the above from GeoNames (CC BY 4.0)
 prompts/GEMINI_EXTRACTION_PROMPT.md    single source of the prompt text
 notebooks/01_phase1_address_extraction.ipynb
-src/swift_address/                     settings, io, grouping, cleaning, schemas,
-                                       reference_data, gemini_client, scoring, cache, pipeline
-tests/                                 222 tests covering the acceptance criteria
-outputs/                               generated; git-ignored
+src/swift_address/                     settings, io, grouping, cleaning, schemas, reference_data,
+                                       gemini_client, scoring, cache, pipeline, reporting
+tests/                                 325 tests covering the acceptance criteria
+tests/fixtures/                        tiny Town/Country fixture used instead of the real file
+outputs/                               generated; git-ignored except outputs/README.md
 ```
 
 ## Starter artifacts

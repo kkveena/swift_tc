@@ -67,3 +67,22 @@ Select scenarios deterministically from verified explicitness and ambiguity. Do 
 
 ## Threshold
 Keep `hitl_threshold` in config. Calibrate against labeled production-like data and report precision/coverage by scenario. Any unresolved multiple-country result is always HITL.
+
+### Threshold reporting
+
+`reporting.build_threshold_sensitivity` evaluates the configured candidate thresholds (default
+`0.80, 0.85, 0.90, 0.95`) over **non-empty address-group instances** and reports, per threshold:
+auto-accept candidate count and percent, HITL count and percent, and — separately — the counts forced
+to HITL by country ambiguity and by extraction errors. Those forced cases are invariant across
+thresholds by design: a numeric score never releases them.
+
+Because the composite is a product, each scenario has a ceiling reached only at perfect confidence:
+`both_explicit` 1.0000, `country_explicit_town_inferred` 0.5000, `town_explicit_country_inferred`
+0.3750, `neither_explicit_both_inferred` 0.0400, ambiguous/no-defensible 0.0000. A threshold above
+0.5000 therefore admits `both_explicit` only, and any threshold between 0.3750 and 0.5000 is
+operationally identical.
+
+`reporting.recommended_threshold` (default **0.90**) is a **provisional routing policy, not
+calibrated accuracy**. Once labeled validation data exists, extend the sensitivity report with
+auto-accepted precision, auto-accepted error rate, and recall/coverage, then adopt the lowest
+threshold that satisfies the business-approved minimum precision.

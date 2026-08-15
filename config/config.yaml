@@ -29,6 +29,10 @@ output:
     combined_address_cleaned: "combined_address_cleaned_group_{id}"
     predicted_town: "predicted_town_group_{id}"
     predicted_country: "predicted_country_group_{id}"
+    # Deterministic expansion of predicted_country via the ISO reference layer.
+    # Never a second model prediction. Stays aligned element-for-element with
+    # predicted_country, including for comma-separated ambiguous candidate sets.
+    predicted_country_name: "predicted_country_name_group_{id}"
     predicted_town_probability: "predicted_town_probability_group_{id}"
     predicted_country_probability: "predicted_country_probability_group_{id}"
     predicted_town_exists: "predicted_town_exists_group_{id}"
@@ -44,6 +48,7 @@ output:
     combined_address_cleaned: "comined_address_cleaned_group_{id}"
     predicted_town: "predicted_town_group_{id}"
     predicted_country: "predicted_countrty_group_{id}"
+    predicted_country_name: "predicted_countrty_name_group_{id}"
     predicted_town_probability: "predicted_town_probability_group_{id}"
     predicted_country_probability: "predicted_countrty_probability_group_{id}"
     predicted_town_exists: "predicted_town_exists_group_{id}"
@@ -103,6 +108,56 @@ reference_data:
   # while excluding a mid-address collision: in "BOSTON MA 02111 US", the US
   # state abbreviation MA must not be read as evidence of Morocco.
   trailing_country_token_window: 2
+
+  # --- Town/Country development reference ---------------------------------
+  # An EXTERNAL RUNTIME DEPENDENCY, not part of this package. The file is large
+  # (~38 MB) and environment-specific: it is git-ignored, never bundled, and
+  # never embedded. `town_country_path` is resolved against the repository root
+  # when relative, so an enterprise deployment repoints it at an approved
+  # managed source through configuration alone.
+  #
+  # Build a development copy with:
+  #   python scripts/build_geonames_town_country_reference.py \
+  #     --output data/reference/town_country_reference.csv
+  # GeoNames data is CC BY 4.0 — preserve attribution.
+  town_country_enabled: true
+  town_country_path: "data/reference/town_country_reference.csv"
+  town_country_source: "development_local_reference"
+  town_country_approved_for_production: false
+  # Physical -> logical column mapping for a file whose headers differ from the
+  # expected schema. Empty means the expected names are used as-is.
+  # e.g. {city: town_name, iso2: country_code}
+  town_country_column_map: {}
+  # 0 = unlimited. A positive value caps how many candidate codes reach the CSV
+  # when reference ambiguity is escalated; the full set always stays in audit.
+  town_country_max_candidates: 0
+  # How a town name that maps to several countries affects the result:
+  #   escalate - preserve every candidate, force country probability/weight and
+  #              the composite score to 0.0, and mandate HITL (default).
+  #   annotate - leave the prediction untouched and record the reference finding
+  #              in the audit trail and metrics only.
+  # `escalate` only fires when the address carries NO explicit country evidence;
+  # an explicitly stated country always wins and is merely checked for
+  # consistency. See README "Implementation decisions".
+  town_country_ambiguity_policy: "escalate"
+
+reporting:
+  enabled: true
+  reports_dir: "outputs/reports"
+  charts_dir: "outputs/charts"
+  executive_summary_filename: "executive_summary.json"
+  score_distribution_filename: "score_distribution.csv"
+  threshold_sensitivity_filename: "threshold_sensitivity.csv"
+  scenario_distribution_filename: "scenario_distribution.csv"
+  histogram_filename: "composite_score_histogram.png"
+  # Lower edges of the score bands. Each band is [edge, next_edge); the last is
+  # closed at 1.0. Scores below the first edge fall into the "< 0.60" band.
+  score_band_edges: [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+  sensitivity_thresholds: [0.80, 0.85, 0.90, 0.95]
+  # Provisional conservative starting point for Phase 1 routing. NOT calibrated
+  # accuracy: replace with the lowest threshold meeting the business-approved
+  # minimum precision once labeled validation data exists.
+  recommended_threshold: 0.90
 
 scoring:
   mode: "composite_weighted"

@@ -46,6 +46,7 @@ from .reference_data import (
     Iso3166Provider,
     ReferenceContext,
     ReferenceDataProvider,
+    TownCountryProvider,
     find_iso_provider,
 )
 from .schemas import (
@@ -123,6 +124,11 @@ class RunResult:
     errors: list[swift_io.ProcessingError]
     pass1: Pass1Result
     audit: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: One row per **non-empty** address-group instance — the denominator the
+    #: executive report uses, since HITL workload occurs at instance level.
+    #: Empty instances are counted, not enumerated, so the frame stays bounded
+    #: by real work rather than by rows x groups.
+    instances: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     @property
     def output_columns(self) -> int:
@@ -147,6 +153,7 @@ class Phase1Pipeline:
         prompt: PromptContract | None = None,
         cache: AddressCache | None = None,
         mode: str = "live",
+        town_country_provider: TownCountryProvider | None = None,
     ) -> None:
         self.config = config
         self.group_config = group_config
@@ -155,6 +162,7 @@ class Phase1Pipeline:
         self.prompt = prompt
         self.mode = mode
         self.iso_provider: Iso3166Provider | None = find_iso_provider(reference_provider)
+        self.town_country_provider = town_country_provider
 
         self.cache = cache if cache is not None else AddressCache(
             config.path(config.processing.cache_path),
@@ -214,6 +222,7 @@ class Phase1Pipeline:
             errors=errors,
             pass1=pass1,
             audit=audit,
+            instances=_build_instance_frame(pass1, decisions),
         )
 
     # -- pass 1 ------------------------------------------------------------
@@ -450,8 +459,15 @@ class Phase1Pipeline:
                 item.address,
                 self.config.scoring,
                 iso_provider=self.iso_provider,
+                town_country_provider=self.town_country_provider,
                 separator=self.config.output.country_candidate_separator,
                 candidate_sort=self.config.output.country_candidate_sort,
+                town_country_ambiguity_policy=(
+                    self.config.reference_data.town_country_ambiguity_policy
+                ),
+                town_country_max_candidates=(
+                    self.config.reference_data.town_country_max_candidates
+                ),
             )
         return decisions
 
@@ -495,6 +511,22 @@ class Phase1Pipeline:
             attempts=getattr(exc, "attempts", 0),
         )
 
+    def _town_country_metrics(self) -> dict[str, Any]:
+        """Reference-file identity and size, so a run is reproducible from metrics."""
+        if self.town_country_provider is None:
+            return {
+                "enabled": self.config.reference_data.town_country_enabled,
+                "loaded": False,
+            }
+        return {
+            "enabled": True,
+            "loaded": True,
+            "ambiguity_policy": (
+                self.config.reference_data.town_country_ambiguity_policy
+            ),
+            **self.town_country_provider.provenance,
+        }
+
     def _log_ref(self, address: str) -> str:
         """Reference an address in logs without printing it.
 
@@ -520,19 +552,24 @@ class Phase1Pipeline:
         elapsed_seconds: float,
     ) -> dict[str, Any]:
         scenarios: Counter[str] = Counter()
+        reference_statuses: Counter[str] = Counter()
         hitl_instances = 0
         ambiguous_instances = 0
         ambiguous_addresses = 0
+        reference_conflict_instances = 0
 
         for key, item in pass1.work_items.items():
             verified, score_result = decisions[key]
             occurrences = len(item.occurrences)
             scenarios[score_result.scenario] += occurrences
+            reference_statuses[verified.reference_status] += occurrences
             if score_result.needs_hitl:
                 hitl_instances += occurrences
             if verified.country_ambiguous:
                 ambiguous_instances += occurrences
                 ambiguous_addresses += 1
+            if verified.reference_conflict:
+                reference_conflict_instances += occurrences
 
         scenarios["null_skip"] += pass1.empty_instances
 
@@ -559,6 +596,7 @@ class Phase1Pipeline:
                 "google_search_grounding": (
                     self.config.model.enable_google_search_grounding
                 ),
+                "town_country": self._town_country_metrics(),
             },
             "shape": {
                 "input_rows": len(result_frame),
@@ -590,6 +628,8 @@ class Phase1Pipeline:
                 "instances_affected_by_errors": sum(e.occurrences for e in errors),
                 "ambiguous_country_addresses": ambiguous_addresses,
                 "ambiguous_country_instances": ambiguous_instances,
+                "reference_status_counts": dict(sorted(reference_statuses.items())),
+                "reference_conflict_instances": reference_conflict_instances,
             },
             "hitl": {
                 "threshold": self.config.scoring.hitl_threshold,
@@ -603,10 +643,15 @@ class Phase1Pipeline:
 
 
 def _row_values(verified: VerifiedExtraction, score_result: ScoreResult) -> list[Any]:
-    """The 9 post-address output values, in :data:`OUTPUT_FIELD_KEYS` order."""
+    """The post-address output values, in :data:`OUTPUT_FIELD_KEYS` order.
+
+    Length is derived from the field tuple, so adding an output field means
+    editing `OUTPUT_FIELD_KEYS` and this list together and nothing else.
+    """
     return [
         verified.town,
         verified.country_value,
+        verified.country_name_value,
         float(verified.town_probability),
         float(verified.country_probability),
         bool(verified.town_exists),
@@ -617,14 +662,61 @@ def _row_values(verified: VerifiedExtraction, score_result: ScoreResult) -> list
     ]
 
 
+#: Column contract of :attr:`RunResult.instances`, also used to build an empty
+#: frame when a run has no non-empty instances at all.
+INSTANCE_COLUMNS: tuple[str, ...] = (
+    "record_id",
+    "group_id",
+    "composite_weighted_score",
+    "scenario",
+    "country_ambiguous",
+    "extraction_error",
+    "reference_status",
+    "needs_hitl",
+)
+
+
+def _build_instance_frame(
+    pass1: Pass1Result,
+    decisions: Mapping[str, tuple[VerifiedExtraction, ScoreResult]],
+) -> pd.DataFrame:
+    """Explode unique-address decisions back to one row per non-empty instance."""
+    records: list[dict[str, Any]] = []
+    for key, item in pass1.work_items.items():
+        verified, score_result = decisions[key]
+        for occurrence in item.occurrences:
+            records.append(
+                {
+                    "record_id": occurrence.record_id,
+                    "group_id": occurrence.group_id,
+                    "composite_weighted_score": float(
+                        score_result.composite_weighted_score
+                    ),
+                    "scenario": score_result.scenario,
+                    "country_ambiguous": bool(verified.country_ambiguous),
+                    "extraction_error": score_result.scenario == "extraction_error",
+                    "reference_status": verified.reference_status,
+                    "needs_hitl": bool(score_result.needs_hitl),
+                }
+            )
+    if not records:
+        return pd.DataFrame(columns=list(INSTANCE_COLUMNS))
+    return pd.DataFrame(records, columns=list(INSTANCE_COLUMNS))
+
+
 def _verified_audit(verified: VerifiedExtraction) -> dict[str, Any]:
     return {
         "town": verified.town,
         "country_candidates": list(verified.country_candidates),
         "country_value": verified.country_value,
+        "country_name_value": verified.country_name_value,
         "town_exists": verified.town_exists,
         "country_exists": verified.country_exists,
         "country_ambiguous": verified.country_ambiguous,
+        # Town/Country reference findings stay in the audit trail; they are not
+        # part of the production CSV contract.
+        "reference_status": verified.reference_status,
+        "reference_codes": list(verified.reference_codes),
         "notes": list(verified.notes),
     }
 
@@ -667,6 +759,7 @@ def run_phase1(
     output_path: str | None = None,
     mode: str = "live",
     write_outputs: bool = True,
+    town_country_provider: TownCountryProvider | None = None,
 ) -> RunResult:
     """Convenience entry point: read, run, write CSV + errors + metrics."""
     frame = swift_io.read_input_csv(
@@ -679,6 +772,7 @@ def run_phase1(
         reference_provider=reference_provider,
         prompt=prompt,
         mode=mode,
+        town_country_provider=town_country_provider,
     )
     result = pipeline.run(frame)
 

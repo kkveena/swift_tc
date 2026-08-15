@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import csv
 import logging
+import unicodedata
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
@@ -30,8 +32,13 @@ __all__ = [
     "ReferenceDataProvider",
     "SwiftRefNotConfiguredError",
     "SwiftRefProvider",
+    "TownCountryProvenance",
+    "TownCountryProvider",
+    "TownCountryReferenceError",
     "build_provider",
+    "build_town_country_provider",
     "find_iso_provider",
+    "resolve_town_country_file",
 ]
 
 logger = logging.getLogger(__name__)
@@ -256,6 +263,26 @@ class Iso3166Provider:
     def record(self, code: str) -> CountryRecord | None:
         return self._by_code.get(code.strip().upper())
 
+    def country_name(self, code: str) -> str:
+        """Expand one alpha-2 code to its reference country name.
+
+        Deterministic and reference-derived — the model is never asked for a
+        country name. An unknown code returns the code itself rather than an
+        empty string, so a name column never silently loses information.
+        """
+        record = self.record(code)
+        if record is None:
+            return code.strip().upper()
+        return record.name or record.alpha2
+
+    def country_names(self, codes: Iterable[str]) -> tuple[str, ...]:
+        """Expand a candidate list, preserving order and length exactly.
+
+        Element-for-element alignment with the code list is the contract:
+        ``("CA", "US")`` becomes ``("Canada", "United States of America")``.
+        """
+        return tuple(self.country_name(code) for code in codes)
+
     def invalid_codes(self, codes: Iterable[str]) -> tuple[str, ...]:
         return tuple(code for code in codes if not self.is_valid_alpha2(code))
 
@@ -285,6 +312,291 @@ class Iso3166Provider:
         # Ambiguous code: require trailing country position.
         window = tokens[-self._trailing_window :]
         return alpha2 in window
+
+
+class TownCountryReferenceError(RuntimeError):
+    """The configured Town/Country reference could not be loaded."""
+
+
+@dataclass(frozen=True)
+class TownCountryProvenance:
+    """What was loaded, from where, and whether it may be trusted in production."""
+
+    path: str
+    rows: int
+    unique_towns: int
+    multi_country_towns: int
+    country_codes: int
+    source_dataset: str
+    source_version: str
+    source_url: str
+    approved_for_production: bool
+    configured_source: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "rows": self.rows,
+            "unique_towns": self.unique_towns,
+            "multi_country_towns": self.multi_country_towns,
+            "country_codes": self.country_codes,
+            "source_dataset": self.source_dataset,
+            "source_version": self.source_version,
+            "source_url": self.source_url,
+            "approved_for_production": self.approved_for_production,
+            "configured_source": self.configured_source,
+        }
+
+
+class TownCountryProvider:
+    """In-memory Town -> country-code index over a local reference file.
+
+    The reference file is an **external runtime dependency**: large
+    (tens of MB), environment-specific, git-ignored, and never bundled with this
+    package. It is read once per run, streamed row by row with the stdlib CSV
+    reader, and collapsed into a dictionary. Per-address lookups are then plain
+    dict hits — the file is never re-scanned::
+
+        provider.lookup_country_codes("AUCKLAND")  -> ("NZ",)
+        provider.lookup_country_codes("HAMILTON")  -> ("BM", "CA", "NZ")
+
+    Each town is indexed under two keys: the file's own normalized form, and a
+    punctuation-folded form, so ``SAINT-DENIS`` in the reference still matches a
+    predicted ``SAINT DENIS``.
+
+    This is a *validation* signal. It never silently rewrites a model result;
+    :mod:`swift_address.scoring` decides what a lookup means.
+    """
+
+    name = "town_country"
+
+    #: Expected logical columns. A file with different headers is mapped via
+    #: `reference_data.town_country_column_map` rather than being rewritten.
+    EXPECTED_COLUMNS: tuple[str, ...] = (
+        "town_name",
+        "town_name_normalized",
+        "country_code",
+        "country_name",
+        "source_dataset",
+        "source_version",
+        "source_url",
+        "approved_for_production",
+    )
+
+    def __init__(
+        self,
+        index: Mapping[str, tuple[str, ...]],
+        *,
+        provenance: TownCountryProvenance,
+        version: str,
+    ) -> None:
+        self._index = dict(index)
+        self._provenance = provenance
+        self._version = version
+
+    # -- construction ------------------------------------------------------
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str | Path,
+        *,
+        version: str,
+        configured_source: str = "development_local_reference",
+        approved_for_production: bool = False,
+        column_map: Mapping[str, str] | None = None,
+    ) -> "TownCountryProvider":
+        """Load and index the reference file. Fails fast when it is absent."""
+        resolved = resolve_town_country_file(path)
+
+        mapping = {str(k): str(v) for k, v in (column_map or {}).items()}
+        # The map is given physical -> logical; invert for lookup by logical.
+        logical_to_physical = {logical: physical for physical, logical in mapping.items()}
+
+        index: dict[str, set[str]] = defaultdict(set)
+        codes_seen: set[str] = set()
+        rows = 0
+        source_dataset = source_version = source_url = ""
+        file_approved: bool | None = None
+
+        delimiter = _sniff_delimiter(resolved)
+        with resolved.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter=delimiter)
+            headers = [(name or "").strip() for name in (reader.fieldnames or [])]
+
+            def column_for(logical: str) -> str | None:
+                physical = logical_to_physical.get(logical, logical)
+                return physical if physical in headers else None
+
+            town_column = column_for("town_name_normalized") or column_for("town_name")
+            code_column = column_for("country_code")
+            raw_town_column = column_for("town_name")
+            if town_column is None or code_column is None:
+                raise TownCountryReferenceError(
+                    f"{resolved} must provide a town column and a country_code column. "
+                    f"Found headers: {', '.join(headers[:12])}. Map differing headers "
+                    "with reference_data.town_country_column_map "
+                    "(physical_name: logical_name)."
+                )
+
+            dataset_column = column_for("source_dataset")
+            version_column = column_for("source_version")
+            url_column = column_for("source_url")
+            approved_column = column_for("approved_for_production")
+
+            for row in reader:
+                code = (row.get(code_column) or "").strip().upper()
+                if not code:
+                    continue
+                town = (row.get(town_column) or "").strip()
+                if not town and raw_town_column:
+                    town = (row.get(raw_town_column) or "").strip()
+                if not town:
+                    continue
+
+                rows += 1
+                codes_seen.add(code)
+                for key in _town_keys(town):
+                    index[key].add(code)
+
+                if rows == 1:
+                    source_dataset = (row.get(dataset_column) or "").strip() if dataset_column else ""
+                    source_version = (row.get(version_column) or "").strip() if version_column else ""
+                    source_url = (row.get(url_column) or "").strip() if url_column else ""
+                    if approved_column:
+                        file_approved = str(row.get(approved_column) or "").strip().lower() in {
+                            "1", "true", "yes", "y",
+                        }
+
+        if not rows:
+            raise TownCountryReferenceError(
+                f"{resolved} contained no usable Town/Country rows"
+            )
+
+        frozen = {town: tuple(sorted(codes)) for town, codes in index.items()}
+        provenance = TownCountryProvenance(
+            path=str(resolved),
+            rows=rows,
+            unique_towns=len(frozen),
+            multi_country_towns=sum(1 for codes in frozen.values() if len(codes) > 1),
+            country_codes=len(codes_seen),
+            source_dataset=source_dataset,
+            source_version=source_version,
+            source_url=source_url,
+            # A file claiming production approval cannot override the operator's
+            # configuration: both must agree before this reads as approved.
+            approved_for_production=bool(approved_for_production and file_approved),
+            configured_source=configured_source,
+        )
+        logger.info(
+            "loaded Town/Country reference: %d row(s), %d unique town(s), "
+            "%d multi-country town(s) from %s",
+            rows, provenance.unique_towns, provenance.multi_country_towns, resolved,
+        )
+        return cls(frozen, provenance=provenance, version=version)
+
+    # -- provider protocol -------------------------------------------------
+
+    def get_context(self, address: str) -> ReferenceContext:  # noqa: ARG002
+        """No address-level context.
+
+        This provider answers a question about a *predicted town*, which does
+        not exist until after extraction. Feeding a whole-address guess into the
+        prompt would invite the model to cite reference data the program never
+        supplied. Its findings are applied post-extraction instead.
+        """
+        return ReferenceContext(sources=(), payload={}, version=self._version)
+
+    @property
+    def context_version(self) -> str:
+        return self._version
+
+    @property
+    def provenance(self) -> dict[str, Any]:
+        return {"provider": self.name, **self._provenance.to_dict()}
+
+    # -- lookup ------------------------------------------------------------
+
+    def lookup_country_codes(self, town: str) -> tuple[str, ...]:
+        """Distinct, sorted ISO alpha-2 codes for a town name. Empty when unknown."""
+        if not town:
+            return ()
+        for key in _town_keys(town):
+            found = self._index.get(key)
+            if found:
+                return found
+        return ()
+
+    def knows(self, town: str) -> bool:
+        return bool(self.lookup_country_codes(town))
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+
+def resolve_town_country_file(path: str | Path) -> Path:
+    """Resolve the configured reference location to an actual file.
+
+    Accepts the exact file, a common data extension appended to an
+    extension-less path, or a directory containing exactly one data file — the
+    configured value in the enhancement brief is extension-less while the
+    generated file carries `.csv`. Nothing is renamed, copied, or rewritten.
+    """
+    candidate = Path(path)
+
+    if candidate.is_file():
+        return candidate
+
+    if candidate.is_dir():
+        members = sorted(
+            child
+            for child in candidate.iterdir()
+            if child.is_file() and child.suffix.lower() in {".csv", ".tsv", ".txt"}
+        )
+        if len(members) == 1:
+            return members[0]
+        raise TownCountryReferenceError(
+            f"{candidate} is a directory containing {len(members)} candidate data "
+            "file(s); set reference_data.town_country_path to the exact file."
+        )
+
+    for suffix in (".csv", ".tsv", ".txt"):
+        with_suffix = candidate.with_name(candidate.name + suffix)
+        if with_suffix.is_file():
+            return with_suffix
+
+    raise TownCountryReferenceError(
+        f"Town/Country reference file not found: {candidate}. "
+        "reference_data.town_country_enabled is true, so this file is required. "
+        "Build a development copy with "
+        "`python scripts/build_geonames_town_country_reference.py --output "
+        f"{candidate if candidate.suffix else str(candidate) + '.csv'}`, point "
+        "reference_data.town_country_path at an approved managed source, or set "
+        "reference_data.town_country_enabled to false. The pipeline will not "
+        "substitute web search or model geographic knowledge for a reference "
+        "file it was told to use."
+    )
+
+
+def _sniff_delimiter(path: Path) -> str:
+    """Detect comma vs tab from the header line. Defaults to comma."""
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        header = handle.readline()
+    return "\t" if header.count("\t") > header.count(",") else ","
+
+
+def _town_keys(town: str) -> tuple[str, ...]:
+    """Index/lookup keys for a town name.
+
+    Two forms: NFKC-uppercase-collapsed (the reference file's own normalization)
+    and a punctuation-folded token form, so hyphenation and apostrophes do not
+    cause misses. Duplicates collapse to one key.
+    """
+    normalized = " ".join(unicodedata.normalize("NFKC", town).upper().split())
+    folded = " ".join(tokens_casefolded(town))
+    if folded and folded != normalized:
+        return (normalized, folded)
+    return (normalized,) if normalized else ()
 
 
 class SwiftRefNotConfiguredError(RuntimeError):
@@ -407,6 +719,30 @@ def build_provider(config: Any, base_dir: Path | None = None) -> ReferenceDataPr
     if config.swiftref_enabled:
         providers.append(SwiftRefProvider())
     return CompositeReferenceDataProvider(providers)
+
+
+def build_town_country_provider(
+    config: Any, base_dir: Path | None = None
+) -> TownCountryProvider | None:
+    """Build the Town/Country provider when enabled, else ``None``.
+
+    Kept separate from :func:`build_provider` because this provider is applied
+    *after* extraction rather than being fed into the prompt.
+    """
+    if not getattr(config, "town_country_enabled", False):
+        return None
+
+    root = base_dir or Path.cwd()
+    path = Path(config.town_country_path)
+    path = path if path.is_absolute() else root / path
+
+    return TownCountryProvider.from_file(
+        path,
+        version=config.reference_context_version,
+        configured_source=config.town_country_source,
+        approved_for_production=config.town_country_approved_for_production,
+        column_map=config.town_country_column_map,
+    )
 
 
 def find_iso_provider(provider: ReferenceDataProvider) -> Iso3166Provider | None:
