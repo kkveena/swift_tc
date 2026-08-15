@@ -295,23 +295,43 @@ class Iso3166Provider:
         in trailing country position, so "SUITE 5 IN TOWER" cannot be read as
         evidence of India.
         """
+        return bool(self.matched_presence_forms(address, code))
+
+    def is_ambiguous_alpha2(self, code: str) -> bool:
+        """Whether this code collides with ordinary address/English vocabulary."""
+        return code.strip().upper() in self._ambiguous
+
+    @property
+    def trailing_country_token_window(self) -> int:
+        return self._trailing_window
+
+    def matched_presence_forms(self, address: str, code: str) -> tuple[str, ...]:
+        """Which textual forms of ``code`` actually occur in ``address``.
+
+        Same rules as :meth:`country_is_present`, but reporting *what* matched
+        rather than merely whether something did. The retraction layer needs
+        this: it may only remove the exact forms deterministic verification
+        found, never a guess at how the country might have been written.
+        """
         record = self.record(code)
         if record is None:
-            return False
+            return ()
 
+        forms: list[str] = []
         for name in record.presence_names:
             if name and contains_token_phrase(address, name):
-                return True
+                forms.append(name)
 
         tokens = tokens_casefolded(address)
         alpha2 = record.alpha2
-        if alpha2 not in tokens:
-            return False
-        if alpha2 not in self._ambiguous:
-            return True
-        # Ambiguous code: require trailing country position.
-        window = tokens[-self._trailing_window :]
-        return alpha2 in window
+        if alpha2 in tokens and (
+            alpha2 not in self._ambiguous
+            # Ambiguous code: require trailing country position.
+            or alpha2 in tokens[-self._trailing_window :]
+        ):
+            forms.append(alpha2)
+
+        return tuple(dict.fromkeys(forms))
 
 
 class TownCountryReferenceError(RuntimeError):

@@ -13,11 +13,12 @@ writing, so deleting this whole tree is safe — the next run rebuilds it.
 
 > **This directory can contain customer and payment address data.**
 
-`phase1_output.csv` carries the source address columns verbatim, and
-`address_cache.jsonl` stores raw cleaned addresses because the cache *is* the
-audit record for what was sent to the model. Treat both as regulated data:
-do not commit them, do not attach them to tickets, and do not copy them outside
-approved storage.
+`phase1_output.csv` carries the source address columns verbatim,
+`phase1_detailed_output.jsonl` carries them again in nested form (including
+per-column before/after retraction detail), and `address_cache.jsonl` stores raw
+cleaned addresses because the cache *is* the audit record for what was sent to
+the model. Treat all three as regulated data: do not commit them, do not attach
+them to tickets, and do not copy them outside approved storage.
 
 The reporting artifacts are deliberately free of raw addresses —
 `executive_summary.json` and the three report CSVs are aggregate-only, and
@@ -29,6 +30,7 @@ so those are the ones safe to circulate.
 | Path | Written by | Contains raw addresses |
 |---|---|---|
 | `phase1_output.csv` | `io.write_output_csv` | **Yes** |
+| `phase1_detailed_output.jsonl` | `serialization.write_detailed_json` | **Yes** |
 | `address_cache.jsonl` | `cache.AddressCache` | **Yes** |
 | `processing_errors.csv` | `io.write_errors_csv` | No — SHA-256 hashes only |
 | `run_metrics.json` | `io.write_metrics_json` | No |
@@ -36,6 +38,7 @@ so those are the ones safe to circulate.
 | `reports/score_distribution.csv` | `reporting.write_reports` | No |
 | `reports/scenario_distribution.csv` | `reporting.write_reports` | No |
 | `reports/threshold_sensitivity.csv` | `reporting.write_reports` | No |
+| `reports/cross_entropy_summary.csv` | `reporting.write_reports` | No |
 | `charts/composite_score_histogram.png` | `reporting.render_score_histogram` | No |
 
 ## Paths are configuration

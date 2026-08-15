@@ -40,6 +40,19 @@ output:
     composite_weighted_score: "composite_weighted_score_group_{id}"
     rationale_town: "rationale_town_group_{id}"
     rationale_country: "rationale_country_group_{id}"
+    # Ground-truth correctness labels. NULLABLE booleans: blank means "no
+    # independent evidence", which is NOT the same as False. Distinct from
+    # predicted_*_exists, which means "explicitly present in the input text".
+    town_exists_ok: "town_exists_ok_group_{id}"
+    country_exists_ok: "country_exists_ok_group_{id}"
+    # Binary cross-entropy of model confidence against those labels. Blank when
+    # no ground truth is available. LOWER is better — the opposite direction to
+    # composite_weighted_score.
+    cross_entropy: "cross_entropy_group_{id}"
+    # Deterministic Python retraction of Town/Country evidence that was actually
+    # verified in the source text. Never a second model call.
+    combined_address_retracted: "combined_address_retracted_group_{id}"
+    combined_address_retracted_comments: "combined_address_retracted_group_comments_{id}"
   # [EXTENSION] Legacy aliases reproduce the original (typo'd) field names from
   # the source screenshots. Selected by naming_style: "legacy". Exactly one
   # naming set is ever emitted — the two sets are never produced together.
@@ -56,6 +69,11 @@ output:
     composite_weighted_score: "composite_weighted_score_group_{id}"
     rationale_town: "rational_town_group_{id}"
     rationale_country: "rational_countrty_group_{id}"
+    town_exists_ok: "town_exists_ok_group_{id}"
+    country_exists_ok: "countrty_exists_ok_group_{id}"
+    cross_entropy: "cross_entropy_group_{id}"
+    combined_address_retracted: "comined_address_retracted_group_{id}"
+    combined_address_retracted_comments: "comined_address_retracted_group_comments_{id}"
 
 model:
   model_env_var: "GEMINI_MODEL"
@@ -87,6 +105,15 @@ processing:
   redact_raw_address_in_logs: true
   # [EXTENSION] Default destination for the expanded output CSV.
   output_path: "outputs/phase1_output.csv"
+  # [EXTENSION] Nested per-record detail. The CSV stays the flat compatibility
+  # artifact; audit and evaluation depth lives here instead of growing dozens
+  # more columns. JSON Lines by default so large runs stream one record at a
+  # time rather than building one huge in-memory array. Contains raw address
+  # data — treat as sensitive; outputs/ is git-ignored.
+  detailed_json_enabled: true
+  detailed_json_path: "outputs/phase1_detailed_output.jsonl"
+  detailed_json_format: "jsonl"     # "jsonl" (default) | "json" (small dev runs)
+  detailed_json_include_empty_groups: true
 
 reference_data:
   provider: "iso3166"             # "null" | "iso3166" | "composite"
@@ -148,6 +175,9 @@ reporting:
   score_distribution_filename: "score_distribution.csv"
   threshold_sensitivity_filename: "threshold_sensitivity.csv"
   scenario_distribution_filename: "scenario_distribution.csv"
+  # Calibration summary over grounded observations only. LOWER is better —
+  # the opposite direction to composite_weighted_score.
+  cross_entropy_summary_filename: "cross_entropy_summary.csv"
   histogram_filename: "composite_score_histogram.png"
   # Lower edges of the score bands. Each band is [edge, next_edge); the last is
   # closed at 1.0. Scores below the first edge fall into the "< 0.60" band.

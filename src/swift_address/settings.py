@@ -30,6 +30,8 @@ __all__ = [
     "ReportingConfig",
     "ScenarioWeights",
     "ScoringConfig",
+    "NULLABLE_BOOLEAN_FIELD_KEYS",
+    "NULLABLE_FLOAT_FIELD_KEYS",
     "OUTPUT_FIELD_KEYS",
     "load_config",
     "resolve_model_name",
@@ -56,7 +58,24 @@ OUTPUT_FIELD_KEYS: tuple[str, ...] = (
     "composite_weighted_score",
     "rationale_town",
     "rationale_country",
+    # --- ground-truth validation, evaluation, and retraction ---------------
+    # Appended rather than interleaved so the position of every pre-existing
+    # column is unchanged for downstream flat-file consumers.
+    "town_exists_ok",
+    "country_exists_ok",
+    "cross_entropy",
+    "combined_address_retracted",
+    "combined_address_retracted_comments",
 )
+
+#: Output fields carrying a *nullable* boolean. "Unknown" is a distinct state
+#: from False: unavailable ground truth is not a wrong prediction.
+NULLABLE_BOOLEAN_FIELD_KEYS: frozenset[str] = frozenset(
+    {"town_exists_ok", "country_exists_ok"}
+)
+
+#: Output fields carrying a nullable float (blank when not computable).
+NULLABLE_FLOAT_FIELD_KEYS: frozenset[str] = frozenset({"cross_entropy"})
 
 #: Environment variables the Google Gen AI SDK accepts for the Developer API.
 API_KEY_ENV_VARS: tuple[str, ...] = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
@@ -181,6 +200,23 @@ class ProcessingConfig(_Base):
     metrics_path: str = "outputs/run_metrics.json"
     output_path: str = "outputs/phase1_output.csv"
     redact_raw_address_in_logs: bool = True
+    #: Nested per-record detail. JSON Lines by default so large runs stream
+    #: instead of building one enormous in-memory array.
+    detailed_json_enabled: bool = True
+    detailed_json_path: str = "outputs/phase1_detailed_output.jsonl"
+    detailed_json_format: str = "jsonl"      # "jsonl" | "json"
+    #: Include null-skipped groups in the detail (with status "null_skip").
+    detailed_json_include_empty_groups: bool = True
+
+    @field_validator("detailed_json_format")
+    @classmethod
+    def _known_format(cls, value: str) -> str:
+        if value not in {"jsonl", "json"}:
+            raise ValueError(
+                "processing.detailed_json_format must be 'jsonl' or 'json', "
+                f"got {value!r}"
+            )
+        return value
 
 
 class ReferenceDataConfig(_Base):
@@ -244,6 +280,7 @@ class ReportingConfig(_Base):
     score_distribution_filename: str = "score_distribution.csv"
     threshold_sensitivity_filename: str = "threshold_sensitivity.csv"
     scenario_distribution_filename: str = "scenario_distribution.csv"
+    cross_entropy_summary_filename: str = "cross_entropy_summary.csv"
     histogram_filename: str = "composite_score_histogram.png"
     #: Lower edges of the score bands. Each band is [edge, next_edge), and the
     #: final band is closed at 1.0 so a perfect score is never dropped.

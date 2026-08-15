@@ -52,6 +52,14 @@ composite_weighted_score = adjusted_town_score × adjusted_country_score
 
 The result is an operational routing score, not a calibrated joint probability unless later validation demonstrates calibration.
 
+**This formula and the weight matrix above are unchanged** by the addition of the ground-truth and
+cross-entropy fields. Those are evaluation outputs; they never enter routing.
+
+| Metric | Question | Direction |
+|---|---|---|
+| Composite Weighted Score | should this be auto-accepted? | **higher is better** |
+| Cross-entropy | did the model's confidence match reality? | **lower is better** |
+
 ## Examples
 
 | Case | Town p | Country p | Town w | Country w | Composite |
@@ -86,3 +94,26 @@ operationally identical.
 calibrated accuracy**. Once labeled validation data exists, extend the sensitivity report with
 auto-accepted precision, auto-accepted error rate, and recall/coverage, then adopt the lowest
 threshold that satisfies the business-approved minimum precision.
+
+An intuitive reading of 0.90: in `both_explicit` with both weights at 1.00 and roughly equal
+confidences, `p × p ≥ 0.90` means `p ≥ √0.90 ≈ 0.949`. So a 0.90 composite threshold approximately
+requires **~95% confidence on both Town and Country**, in the one scenario where nothing was
+inferred.
+
+The notebooks render this reasoning in a dedicated "Human-in-the-Loop Threshold Recommendation"
+section, showing the configured operational threshold and the recommended analytical threshold
+*separately* — the recommendation never silently overwrites `scoring.hitl_threshold`.
+
+## Cross-entropy (evaluation, not routing)
+
+`cross_entropy_group_<id>` is binary log loss of model confidence against the nullable ground-truth
+labels described in README:
+
+```text
+BCE(y, p) = -( y*log(p) + (1-y)*log(1-p) )     p clipped to [1e-6, 1-1e-6]
+```
+
+Both labels available → mean of the two component losses. One → that component (status `town_only` /
+`country_only`). Neither → blank. Observations without ground truth are **excluded** from the metric,
+never assigned an artificially high loss: a reference-coverage gap is not a model error. Component
+detail lives in the detailed JSON. Gemini never computes it.
