@@ -442,6 +442,106 @@ class TestGroupCrossEntropy:
         assert null_cross_entropy().group_cross_entropy is None
         assert null_cross_entropy().status == STATUS_NOT_AVAILABLE
 
+    def test_ungrounded_components_report_none_not_a_collapsed_false(
+        self, iso_provider, town_country_provider
+    ):
+        """Inside the audit payload, ungrounded means None — never False.
+
+        The collapse of unknown into False is scoped to the `*_exists_ok` CSV
+        columns. The audit trail keeps "contradicted" and "no evidence" apart,
+        so `*_correct` is gated on availability exactly like `*_probability`
+        and `*_cross_entropy` beside it.
+        """
+        verified = verify(
+            make_response(town="NOWHERESVILLE", country_candidates=[],
+                          country_is_explicit=False),
+            "1 MAIN STREET NOWHERESVILLE", iso_provider, town_country_provider,
+        )
+        truth = evaluate_ground_truth(
+            verified, town_country_provider=town_country_provider
+        )
+        result = compute_cross_entropy(verified, truth)
+
+        assert truth.town_available is False
+        assert truth.town_exists_ok is False        # the collapsed CSV value
+        assert result.town_correct is None          # but the audit says "unknown"
+        assert result.town_probability is None
+        assert result.town_cross_entropy is None
+
+    def test_null_skip_and_ungrounded_extraction_agree(
+        self, iso_provider, town_country_provider
+    ):
+        """Two ungrounded states must report the same *values*.
+
+        A null-skipped group and an extracted-but-ungrounded one are both
+        `available=False`. They previously disagreed on `*_correct`: null-skip
+        reported None, the extracted one a collapsed False.
+
+        `status` is excluded on purpose — it exists precisely to say *why* a
+        component is ungrounded, so `reference_not_found` being more specific
+        than `not_available` is the field working as intended.
+        """
+        verified = verify(
+            make_response(town="NOWHERESVILLE", country_candidates=[],
+                          country_is_explicit=False),
+            "1 MAIN STREET NOWHERESVILLE", iso_provider, town_country_provider,
+        )
+        ungrounded = compute_cross_entropy(
+            verified,
+            evaluate_ground_truth(
+                verified, town_country_provider=town_country_provider
+            ),
+        ).to_dict()
+        null_skip = null_cross_entropy().to_dict()
+
+        for key in (
+            "town_ground_truth_available", "town_correct", "town_probability",
+            "town_cross_entropy", "country_ground_truth_available",
+            "country_correct", "country_probability", "country_cross_entropy",
+            "group_cross_entropy",
+        ):
+            assert ungrounded[key] == null_skip[key], key
+
+        # Both are ungrounded statuses; only the reason differs.
+        assert ungrounded["status"] == STATUS_REFERENCE_NOT_FOUND
+        assert null_skip["status"] == STATUS_NOT_AVAILABLE
+
+    def test_grounded_components_still_report_their_label(
+        self, iso_provider, town_country_provider
+    ):
+        """Gating on availability must not blank out a real judgement."""
+        verified = verify(
+            make_response(), "1 LINCOLN STREET BOSTON MA 02111 US",
+            iso_provider, town_country_provider,
+        )
+        result = compute_cross_entropy(
+            verified,
+            evaluate_ground_truth(
+                verified, town_country_provider=town_country_provider
+            ),
+        )
+        assert result.town_correct is True
+        assert result.country_correct is True
+
+    def test_a_refuted_claim_still_reports_false_not_none(
+        self, iso_provider, town_country_provider
+    ):
+        """AERONAUTICA -> RONA is grounded: a real contradiction, not a gap."""
+        verified = verify(
+            make_response(town="RONA", town_evidence="RONA", town_is_explicit=True,
+                          country_candidates=[], country_is_explicit=False),
+            "AERONAUTICA", iso_provider, town_country_provider,
+        )
+        result = compute_cross_entropy(
+            verified,
+            evaluate_ground_truth(
+                verified, town_country_provider=town_country_provider
+            ),
+        )
+        assert result.town_ground_truth_available is True
+        assert result.town_correct is False
+        assert result.town_cross_entropy is not None
+
     def test_json_payload_shape(self, iso_provider, town_country_provider):
         verified = verify(
             make_response(), "1 LINCOLN STREET BOSTON MA 02111 US",

@@ -8,7 +8,7 @@ present in the input address text?"**. Their meaning is unchanged.
 
 ``town_exists_ok`` / ``country_exists_ok`` (produced here) answer a different
 question: **"when independent deterministic evidence is available, was the
-prediction correct?"** They are plain booleans — ``<NA>`` never appears in a
+prediction correct?"** They are plain booleans — ``<NA>`` never appears in an
 output column or report built from them:
 
 ===========  ===============================================================
@@ -23,6 +23,12 @@ contradiction. The two are still told apart internally — see ``town_basis`` /
 properties — so cross-entropy and the reporting correctness-rate keep
 excluding genuine coverage gaps from the loss rather than counting them as
 model errors.
+
+The collapse is scoped to those two output columns. Inside
+:class:`CrossEntropyResult` — the audit payload — an ungrounded component
+reports ``None`` for ``*_correct``, ``*_probability`` and ``*_cross_entropy``
+alike, so "we judged this wrong" and "we had nothing to judge it against"
+remain distinguishable where the distinction is the whole point.
 
 Cross-entropy scores how well the model's *confidence* matched those labels. It
 is an evaluation metric, not a routing metric:
@@ -316,13 +322,24 @@ def compute_cross_entropy(
     available = [value for value in (town_ce, country_ce) if value is not None]
     group_ce = sum(available) / len(available) if available else None
 
+    # `*_correct` is gated on availability, exactly like `*_probability` and
+    # `*_cross_entropy` beside it: inside the audit payload an ungrounded
+    # component reports None, not a collapsed False. The collapse to False is
+    # scoped to the `*_exists_ok` CSV columns; the audit trail keeps
+    # "contradicted" and "no evidence" apart. Without this gate a null-skipped
+    # group and an extracted-but-ungrounded one — identical in meaning, both
+    # `available=False`, `status=not_available` — reported different values.
     return CrossEntropyResult(
         town_ground_truth_available=ground_truth.town_available,
-        town_correct=ground_truth.town_exists_ok,
+        town_correct=(
+            ground_truth.town_exists_ok if ground_truth.town_available else None
+        ),
         town_probability=town_probability if ground_truth.town_available else None,
         town_cross_entropy=town_ce,
         country_ground_truth_available=ground_truth.country_available,
-        country_correct=ground_truth.country_exists_ok,
+        country_correct=(
+            ground_truth.country_exists_ok if ground_truth.country_available else None
+        ),
         country_probability=(
             country_probability if ground_truth.country_available else None
         ),
