@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- SWIFT address extraction Phase 1 ---
+# Generated run artifacts. outputs/address_cache.jsonl holds raw addresses as its
+# audit record, so this directory must never reach version control.
+outputs/

@@ -192,6 +192,163 @@ References:
 - https://www.swift.com/products/swiftref-bic-directory
 - https://www.iso.org/iso-3166-country-codes.html
 
+## Running the pipeline
+
+### Setup
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Dry run (no credentials, no network)
+
+With no Gemini credentials in the environment, the pipeline uses an offline stub and still
+exercises every stage — grouping, cleaning, null skip, dedupe, verification, scoring, output.
+
+```bash
+jupyter notebook notebooks/01_phase1_address_extraction.ipynb
+```
+
+or non-interactively:
+
+```bash
+jupyter nbconvert --to notebook --execute --inplace \
+  notebooks/01_phase1_address_extraction.ipynb
+```
+
+The stub is not an extraction model. Its country comes only from ISO codes the program can
+actually find in the address text, its town from a tiny demo list, and every rationale it writes
+says so. Run metrics record `"mode": "dry_run"`.
+
+### Live run against Gemini
+
+```bash
+cp .env.example .env          # then fill in .env (git-ignored), or export directly
+export GEMINI_API_KEY=...     # never committed, never logged, never printed
+export GEMINI_MODEL=gemini-3.5-flash
+jupyter nbconvert --to notebook --execute --inplace \
+  notebooks/01_phase1_address_extraction.ipynb
+```
+
+For enterprise Vertex AI, set `GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT` and
+`GOOGLE_CLOUD_LOCATION` instead of an API key. The client is constructed with no arguments and
+reads its configuration from the environment, so this is a deployment change, not a code change.
+
+Set `SWIFT_ADDRESS_DRY_RUN=true` to force the offline stub even when credentials are present.
+
+### From Python
+
+```python
+from swift_address.grouping import load_group_config
+from swift_address.pipeline import run_phase1
+from swift_address.reference_data import build_provider, find_iso_provider
+from swift_address.schemas import load_prompt_contract
+from swift_address.settings import load_config, resolve_model_name
+from swift_address.gemini_client import build_client
+
+config = load_config("config/config.yaml")
+group_config = load_group_config(config.path(config.project.group_config_path))
+provider = build_provider(config.reference_data, base_dir=config.base_dir)
+prompt = load_prompt_contract(config.path(config.project.prompt_path),
+                              config.project.prompt_version)
+client = build_client(config.model, prompt, model=resolve_model_name(config),
+                      iso_provider=find_iso_provider(provider), dry_run=False)
+
+result = run_phase1("data/sample_input.csv", config, group_config,
+                    client=client, reference_provider=provider, prompt=prompt)
+```
+
+### Tests
+
+```bash
+python -m pytest          # 222 tests
+```
+
+### Outputs
+
+| Path | Contents |
+|---|---|
+| `outputs/phase1_output.csv` | every input column unchanged + 11 columns per enabled group |
+| `outputs/processing_errors.csv` | one row per failed unique address; addresses referenced by hash |
+| `outputs/run_metrics.json` | shape, null-skip and dedupe savings, cache/call counts, scenario counts, HITL counts, reference-data provenance |
+| `outputs/address_cache.jsonl` | cached extractions + audit metadata (**contains raw addresses; git-ignored**) |
+
+## Implementation decisions
+
+Decisions taken where the starter artifacts were silent or inconsistent. Each is configuration
+plus documentation rather than an assumption buried in code.
+
+1. **`config/config.yaml`** is the file the pipeline loads; `config.example.yaml` is left untouched
+   as the supplied sample. Every key added beyond the example is marked `[EXTENSION]` in place.
+   Override the path with `SWIFT_ADDRESS_CONFIG`.
+2. **`.env.example` and `data/reference/iso3166.csv` were referenced but absent** from the starter
+   artifacts, and have been created. The ISO dataset is a *development fallback*; its status is
+   recorded in `data/reference/PROVENANCE.md`, reported by `Iso3166Provider.provenance`, and written
+   into `run_metrics.json` on every run, so no run can quietly claim approved reference data.
+3. **`*_exists` is decided by the text, not by the model.** The predicted value is matched against
+   the address on token boundaries (`AERONAUTICA` does not contain the token `RONA`). A model claim
+   of explicit support that the text cannot carry becomes `False`, and the disagreement is recorded
+   in the audit notes. The reverse is also recorded: a value the model called "inferred" that is
+   literally present is marked `True` with a `town_present_though_model_marked_inferred` note.
+4. **Colliding two-letter codes.** A bare alpha-2 token is not accepted as explicit country evidence
+   when the code collides with ordinary address vocabulary (`IN`, `IT`, `NO`, `ME`, `MA`, …) unless
+   it sits in trailing country position. Without this, "SUITE 5 IN TOWER" would prove India, and the
+   US state abbreviation in "BOSTON MA 02111 US" would prove Morocco. The collision list and the
+   trailing window are in `reference_data` config.
+5. **A seventh scoring scenario.** `SCORING_SPEC.md`'s six scenarios have no row for *country
+   ambiguous **and** town not explicitly supported*. Reusing `town_explicit_country_ambiguous` there
+   would assert a verified explicitness that does not exist, so `town_inferred_country_ambiguous`
+   (0.20 / 0.00) is configured separately. The composite is `0.0` either way — the distinct name
+   only keeps the audit trail truthful. Removing it from config falls back to
+   `no_defensible_prediction`.
+6. **Partial predictions get no partial credit.** A defensible town with no defensible country (or
+   vice versa) maps to `no_defensible_prediction`. One factor of the product is missing, so the
+   composite is `0.0` regardless of the weights chosen.
+7. **Text-resolved ambiguity.** When several candidates are returned but exactly *one* is explicitly
+   present in the address, the text has resolved the choice and the result collapses to that code,
+   with a note. Two candidates that are *both* named in the text stay ambiguous — that is still an
+   unresolved choice, and the pipeline never picks one.
+8. **Ambiguity zeroing is policy, not a YAML value.** More than one surviving candidate forces
+   country probability *and* country weight to `0.0` in code, so editing the weight matrix cannot
+   turn an unresolved multi-country result into a passing score.
+9. **Failures are never conclusions.** An exhausted retry writes a row to `processing_errors.csv`,
+   leaves the dataframe row intact with safe neutral values, marks scenario `extraction_error`,
+   forces HITL, and leaves the rationale fields empty. `NO_TOWN` from the null path and `NO_TOWN`
+   from a failed call are distinguishable in the metrics and the audit trail.
+10. **Retry asymmetry.** Transient transport failures (429, 5xx, timeouts, connection resets) retry
+    with bounded exponential backoff and jitter. Malformed *business* output is retried once, then
+    recorded as an error.
+11. **Canonical field names by default.** The typo'd names from the source screenshots
+    (`comined_`, `countrty`, `rational_`) are available as `output.naming_style: "legacy"`. Exactly
+    one naming set is ever emitted; a test asserts the two never appear together.
+12. **Group 16 (`PRI_SNDR_CORR`) remains provisional**, as flagged in the starter notes. It is
+    enabled in `config/group_config.csv` and must be confirmed against the authoritative project
+    config before production use. Disabling it changes the column arithmetic automatically —
+    nothing in the code knows the number 16.
+13. **Public web-search grounding is refused in code**, not merely defaulted off: constructing the
+    Gemini client with grounding enabled raises. This data may contain customer and payment
+    addresses.
+14. **Logs reference addresses by SHA-256**, never in plaintext, unless
+    `SWIFT_ADDRESS_ALLOW_RAW_LOGS=true` is set in an approved debugging environment. The cache and
+    the audit payload hold the raw text because they *are* the audit record; `outputs/` is
+    git-ignored for that reason.
+
+## Repository layout
+
+```text
+config/config.yaml                     runtime config (loaded); config.example.yaml is the sample
+config/group_config.csv                16 groups x 3 lines; any N groups / N lines is supported
+data/reference/iso3166.csv             ISO 3166-1 development fallback (see PROVENANCE.md)
+prompts/GEMINI_EXTRACTION_PROMPT.md    single source of the prompt text
+notebooks/01_phase1_address_extraction.ipynb
+src/swift_address/                     settings, io, grouping, cleaning, schemas,
+                                       reference_data, gemini_client, scoring, cache, pipeline
+tests/                                 222 tests covering the acceptance criteria
+outputs/                               generated; git-ignored
+```
+
 ## Starter artifacts
 
 - `architecture.md` — component and processing design.

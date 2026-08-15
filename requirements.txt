@@ -1,0 +1,33 @@
+# SWIFT Address Extraction — Phase 1 runtime requirements
+#
+# Python 3.11+ required.
+#
+# Install:
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+
+# Dataframe / CSV processing
+pandas>=2.2
+
+# Config + LLM response validation
+pydantic>=2.7
+PyYAML>=6.0
+
+# Google Gen AI SDK (Gemini). Optional at import time: the pipeline runs in
+# dry-run/mock mode without it, but it is required for real extraction runs.
+google-genai>=1.0
+
+# Bounded retry / exponential backoff with jitter
+tenacity>=8.2
+
+# Local development convenience only. The code reads os.environ directly and
+# works without a .env file present.
+python-dotenv>=1.0
+
+# Notebook execution
+jupyter>=1.0
+nbformat>=5.9
+nbconvert>=7.0
+
+# Tests
+pytest>=8.0
