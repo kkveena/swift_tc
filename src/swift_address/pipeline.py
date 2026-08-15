@@ -54,10 +54,33 @@ from .schemas import (
     PromptContract,
     parse_extraction_response,
 )
+from .serialization import write_detailed_json
+from .evaluation import (
+    CrossEntropyResult,
+    GroundTruth,
+    compute_cross_entropy,
+    evaluate_ground_truth,
+    null_cross_entropy,
+    null_ground_truth,
+)
+from .retraction import RetractionResult, null_retraction, retract_group
 from .scoring import ScoreResult, VerifiedExtraction, error_result, evaluate, null_result
-from .settings import AppConfig, OUTPUT_FIELD_KEYS, raw_logs_allowed
+from .settings import (
+    NULLABLE_BOOLEAN_FIELD_KEYS,
+    NULLABLE_FLOAT_FIELD_KEYS,
+    OUTPUT_FIELD_KEYS,
+    AppConfig,
+    raw_logs_allowed,
+)
 
-__all__ = ["Phase1Pipeline", "Pass1Result", "RunResult", "WorkItem", "run_phase1"]
+__all__ = [
+    "Decision",
+    "Pass1Result",
+    "Phase1Pipeline",
+    "RunResult",
+    "WorkItem",
+    "run_phase1",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +115,28 @@ class WorkItem:
         return tuple(dict.fromkeys(occ.record_id for occ in self.occurrences))
 
 
+@dataclass(frozen=True)
+class Decision:
+    """Everything Python concluded about one unique address.
+
+    Verification and scoring depend only on the cleaned address and the model
+    response, both shared across occurrences, so a decision is computed once per
+    unique address and broadcast. Retraction is deliberately *not* here: it
+    depends on how the address was split across source columns, which varies per
+    row.
+    """
+
+    verified: VerifiedExtraction
+    score: ScoreResult
+    ground_truth: GroundTruth
+    cross_entropy: CrossEntropyResult
+
+    @classmethod
+    def null(cls) -> "Decision":
+        verified, score_result = null_result()
+        return cls(verified, score_result, null_ground_truth(), null_cross_entropy())
+
+
 @dataclass
 class Pass1Result:
     """Outcome of the deterministic first pass."""
@@ -124,6 +169,9 @@ class RunResult:
     errors: list[swift_io.ProcessingError]
     pass1: Pass1Result
     audit: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Decisions keyed by cleaned address, for the detailed-JSON writer. Bounded
+    #: by the unique-address count, not by row count.
+    decisions_by_address: dict[str, Decision] = field(default_factory=dict)
     #: One row per **non-empty** address-group instance — the denominator the
     #: executive report uses, since HITL workload occurs at instance level.
     #: Empty instances are counted, not enumerated, so the frame stays bounded
@@ -210,8 +258,10 @@ class Phase1Pipeline:
                 "address_hash": address_hash(pass1.work_items[key].address),
                 "occurrences": len(pass1.work_items[key].occurrences),
                 "group_ids": list(pass1.work_items[key].group_ids),
-                "verified": _verified_audit(decision[0]),
-                "score": decision[1].to_audit_dict(),
+                "verified": _verified_audit(decision.verified),
+                "score": decision.score.to_audit_dict(),
+                "ground_truth": decision.ground_truth.to_dict(),
+                "cross_entropy": decision.cross_entropy.to_dict(),
             }
             for key, decision in decisions.items()
             if key in pass1.work_items
@@ -222,6 +272,10 @@ class Phase1Pipeline:
             errors=errors,
             pass1=pass1,
             audit=audit,
+            decisions_by_address={
+                item.address: decisions[key]
+                for key, item in pass1.work_items.items()
+            },
             instances=_build_instance_frame(pass1, decisions),
         )
 
@@ -238,8 +292,14 @@ class Phase1Pipeline:
         empty_instances = 0
         non_empty_instances = 0
 
-        null_verified, null_score = null_result()
-        null_values = _row_values(null_verified, null_score)
+        # Null path: unknown ground truth (never False), no cross-entropy, and
+        # an empty retraction. Computed once and reused for every empty instance.
+        null_values_by_group = {
+            group.group_id: _row_values(
+                Decision.null(), null_retraction(group.source_fields)
+            )
+            for group in self.group_config.enabled_groups
+        }
 
         prompt_version = self.config.project.prompt_version
         reference_version = self.reference_provider.context_version
@@ -249,6 +309,7 @@ class Phase1Pipeline:
             column_names = self.config.group_column_names(group.group_id)
             columns: dict[str, list[Any]] = {name: [] for name in column_names}
             source_values = [frame[field].tolist() for field in group.source_fields]
+            null_values = null_values_by_group[group.group_id]
 
             for row_index in range(len(frame)):
                 combined = build_combined_address(
@@ -441,20 +502,28 @@ class Phase1Pipeline:
 
     def _decide(
         self, pass1: Pass1Result, outcomes: Mapping[str, ExtractionOutcome]
-    ) -> dict[str, tuple[VerifiedExtraction, ScoreResult]]:
-        """Verify and score once per unique address, not once per occurrence.
+    ) -> dict[str, Decision]:
+        """Verify, score, label and evaluate once per unique address.
 
         Verification depends only on the cleaned address and the model response,
         both of which are shared across occurrences, so this is exact rather
         than an approximation.
         """
-        decisions: dict[str, tuple[VerifiedExtraction, ScoreResult]] = {}
+        decisions: dict[str, Decision] = {}
         for key, item in pass1.work_items.items():
             outcome = outcomes.get(key)
             if outcome is None:
-                decisions[key] = error_result("extraction_unavailable")
+                verified, score_result = error_result("extraction_unavailable")
+                ground_truth = evaluate_ground_truth(verified, extraction_failed=True)
+                decisions[key] = Decision(
+                    verified=verified,
+                    score=score_result,
+                    ground_truth=ground_truth,
+                    cross_entropy=compute_cross_entropy(verified, ground_truth),
+                )
                 continue
-            decisions[key] = evaluate(
+
+            verified, score_result = evaluate(
                 outcome.response,
                 item.address,
                 self.config.scoring,
@@ -469,21 +538,40 @@ class Phase1Pipeline:
                     self.config.reference_data.town_country_max_candidates
                 ),
             )
+            ground_truth = evaluate_ground_truth(
+                verified, town_country_provider=self.town_country_provider
+            )
+            decisions[key] = Decision(
+                verified=verified,
+                score=score_result,
+                ground_truth=ground_truth,
+                cross_entropy=compute_cross_entropy(verified, ground_truth),
+            )
         return decisions
 
     def _write_results(
         self,
         pass1: Pass1Result,
-        decisions: Mapping[str, tuple[VerifiedExtraction, ScoreResult]],
+        decisions: Mapping[str, Decision],
     ) -> pd.DataFrame:
         frame = pass1.frame
         # Column-major staging: gather every update per column, then assign once.
         updates: dict[str, dict[int, Any]] = defaultdict(dict)
+        fields_by_group = {
+            group.group_id: group.source_fields
+            for group in self.group_config.enabled_groups
+        }
 
         for key, item in pass1.work_items.items():
-            verified, score_result = decisions[key]
-            values = _row_values(verified, score_result)
+            decision = decisions[key]
             for occurrence in item.occurrences:
+                # Retraction is per row/group: the same cleaned address can be
+                # split differently across source columns from one row to the next.
+                retraction = self.retract_occurrence(
+                    frame, occurrence.row_index, occurrence.group_id,
+                    fields_by_group[occurrence.group_id], decision.verified,
+                )
+                values = _row_values(decision, retraction)
                 names = self.config.group_column_names(occurrence.group_id)
                 for name, value in zip(names[2:], values):
                     updates[name][occurrence.row_index] = value
@@ -495,6 +583,36 @@ class Phase1Pipeline:
             frame[column] = series
 
         return _coerce_output_dtypes(frame, self.config, self.group_config)
+
+    def retract_occurrence(
+        self,
+        frame: pd.DataFrame,
+        row_index: int,
+        group_id: str,
+        source_fields: Sequence[str],
+        verified: VerifiedExtraction,
+    ) -> RetractionResult:
+        """Retract one (row, group) instance from its original source columns.
+
+        Reads the source columns; never writes them. The same pure function
+        serves the CSV columns and the detailed-JSON writer, so the two can
+        never disagree.
+        """
+        source_values = {
+            field_name: frame.iloc[row_index][field_name]
+            for field_name in source_fields
+            if field_name in frame.columns
+        }
+        return retract_group(
+            source_values,
+            source_fields,
+            town=verified.town,
+            country_value=verified.country_value,
+            town_exists=verified.town_exists,
+            country_exists=verified.country_exists,
+            iso_provider=self.iso_provider,
+            zero_is_missing=self.config.input.zero_field_is_missing,
+        )
 
     # -- reporting ---------------------------------------------------------
 
@@ -542,7 +660,7 @@ class Phase1Pipeline:
         self,
         *,
         pass1: Pass1Result,
-        decisions: Mapping[str, tuple[VerifiedExtraction, ScoreResult]],
+        decisions: Mapping[str, Decision],
         errors: Sequence[swift_io.ProcessingError],
         usage_totals: Mapping[str, int],
         cache_loaded: int,
@@ -553,14 +671,22 @@ class Phase1Pipeline:
     ) -> dict[str, Any]:
         scenarios: Counter[str] = Counter()
         reference_statuses: Counter[str] = Counter()
+        cross_entropy_statuses: Counter[str] = Counter()
         hitl_instances = 0
         ambiguous_instances = 0
         ambiguous_addresses = 0
         reference_conflict_instances = 0
+        town_grounded = country_grounded = 0
 
         for key, item in pass1.work_items.items():
-            verified, score_result = decisions[key]
+            decision = decisions[key]
+            verified, score_result = decision.verified, decision.score
             occurrences = len(item.occurrences)
+            cross_entropy_statuses[decision.cross_entropy.status] += occurrences
+            if decision.ground_truth.town_available:
+                town_grounded += occurrences
+            if decision.ground_truth.country_available:
+                country_grounded += occurrences
             scenarios[score_result.scenario] += occurrences
             reference_statuses[verified.reference_status] += occurrences
             if score_result.needs_hitl:
@@ -631,6 +757,14 @@ class Phase1Pipeline:
                 "reference_status_counts": dict(sorted(reference_statuses.items())),
                 "reference_conflict_instances": reference_conflict_instances,
             },
+            "evaluation": {
+                "cross_entropy_status_counts": dict(
+                    sorted(cross_entropy_statuses.items())
+                ),
+                "town_ground_truth_instances": town_grounded,
+                "country_ground_truth_instances": country_grounded,
+                "non_empty_instances": pass1.non_empty_instances,
+            },
             "hitl": {
                 "threshold": self.config.scoring.hitl_threshold,
                 "instances_below_threshold": hitl_instances,
@@ -642,12 +776,18 @@ class Phase1Pipeline:
         }
 
 
-def _row_values(verified: VerifiedExtraction, score_result: ScoreResult) -> list[Any]:
+def _row_values(decision: Decision, retraction: RetractionResult) -> list[Any]:
     """The post-address output values, in :data:`OUTPUT_FIELD_KEYS` order.
 
     Length is derived from the field tuple, so adding an output field means
     editing `OUTPUT_FIELD_KEYS` and this list together and nothing else.
+
+    ``town_exists_ok`` / ``country_exists_ok`` stay ``None`` when unknown —
+    they are nullable, and collapsing unknown to False would invent model
+    errors. ``cross_entropy`` is likewise ``None`` when ungrounded, which the
+    CSV writes as a blank cell rather than a misleading zero.
     """
+    verified = decision.verified
     return [
         verified.town,
         verified.country_value,
@@ -656,9 +796,16 @@ def _row_values(verified: VerifiedExtraction, score_result: ScoreResult) -> list
         float(verified.country_probability),
         bool(verified.town_exists),
         bool(verified.country_exists),
-        float(score_result.composite_weighted_score),
+        float(decision.score.composite_weighted_score),
         verified.rationale_town,
         verified.rationale_country,
+        decision.ground_truth.town_exists_ok,
+        decision.ground_truth.country_exists_ok,
+        # Rounded to the same 6 places the detailed JSON uses, so the two
+        # representations of the same number are byte-comparable.
+        _round_or_none(decision.cross_entropy.group_cross_entropy),
+        retraction.combined_address_retracted,
+        retraction.comment,
     ]
 
 
@@ -673,17 +820,27 @@ INSTANCE_COLUMNS: tuple[str, ...] = (
     "extraction_error",
     "reference_status",
     "needs_hitl",
+    # Evaluation columns. Nullable: an ungrounded instance is excluded from the
+    # loss rather than counted as a model failure.
+    "town_exists_ok",
+    "country_exists_ok",
+    "cross_entropy",
+    "cross_entropy_status",
+    # Raw confidences, kept for calibration diagnostics.
+    "town_probability",
+    "country_probability",
 )
 
 
 def _build_instance_frame(
     pass1: Pass1Result,
-    decisions: Mapping[str, tuple[VerifiedExtraction, ScoreResult]],
+    decisions: Mapping[str, Decision],
 ) -> pd.DataFrame:
     """Explode unique-address decisions back to one row per non-empty instance."""
     records: list[dict[str, Any]] = []
     for key, item in pass1.work_items.items():
-        verified, score_result = decisions[key]
+        decision = decisions[key]
+        verified, score_result = decision.verified, decision.score
         for occurrence in item.occurrences:
             records.append(
                 {
@@ -697,11 +854,26 @@ def _build_instance_frame(
                     "extraction_error": score_result.scenario == "extraction_error",
                     "reference_status": verified.reference_status,
                     "needs_hitl": bool(score_result.needs_hitl),
+                    "town_exists_ok": decision.ground_truth.town_exists_ok,
+                    "country_exists_ok": decision.ground_truth.country_exists_ok,
+                    "cross_entropy": decision.cross_entropy.group_cross_entropy,
+                    "cross_entropy_status": decision.cross_entropy.status,
+                    "town_probability": float(verified.town_probability),
+                    "country_probability": float(verified.country_probability),
                 }
             )
     if not records:
         return pd.DataFrame(columns=list(INSTANCE_COLUMNS))
-    return pd.DataFrame(records, columns=list(INSTANCE_COLUMNS))
+
+    frame = pd.DataFrame(records, columns=list(INSTANCE_COLUMNS))
+    frame["town_exists_ok"] = frame["town_exists_ok"].astype("boolean")
+    frame["country_exists_ok"] = frame["country_exists_ok"].astype("boolean")
+    frame["cross_entropy"] = pd.to_numeric(frame["cross_entropy"], errors="coerce")
+    return frame
+
+
+def _round_or_none(value: float | None, digits: int = 6) -> float | None:
+    return None if value is None else round(float(value), digits)
 
 
 def _verified_audit(verified: VerifiedExtraction) -> dict[str, Any]:
@@ -741,6 +913,14 @@ def _coerce_output_dtypes(
             column = config.output.column_name(key, group.group_id)
             if key in float_keys:
                 frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(float)
+            elif key in NULLABLE_FLOAT_FIELD_KEYS:
+                # NaN, so an ungrounded observation writes a blank CSV cell
+                # rather than a 0.0 that would read as a perfect score.
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            elif key in NULLABLE_BOOLEAN_FIELD_KEYS:
+                # pandas BooleanDtype keeps True / False / <NA> distinct;
+                # plain bool would silently turn "unknown" into False.
+                frame[column] = frame[column].astype("boolean")
             elif key in bool_keys:
                 frame[column] = frame[column].astype(bool)
             else:
@@ -785,4 +965,17 @@ def run_phase1(
         swift_io.write_metrics_json(
             result.metrics, config.path(config.processing.metrics_path)
         )
+        if config.processing.detailed_json_enabled:
+            write_detailed_json(
+                result.frame,
+                config.path(config.processing.detailed_json_path),
+                config=config,
+                group_config=group_config,
+                decisions_by_address=result.decisions_by_address,
+                iso_provider=pipeline.iso_provider,
+                output_format=config.processing.detailed_json_format,
+                include_empty_groups=(
+                    config.processing.detailed_json_include_empty_groups
+                ),
+            )
     return result

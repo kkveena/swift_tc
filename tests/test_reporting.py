@@ -9,12 +9,14 @@ import pytest
 
 from swift_address.reporting import (
     band_labels,
+    build_cross_entropy_summary,
     build_executive_summary,
     build_kpi_table,
     build_scenario_distribution,
     build_score_distribution,
     build_threshold_sensitivity,
     classify_score,
+    data_derived_strings,
     render_score_histogram,
     write_reports,
 )
@@ -24,7 +26,7 @@ EDGES = (0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
 
 def instances(rows) -> pd.DataFrame:
     """Build an instance frame from (score, scenario, ambiguous, error) tuples."""
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         [
             {
                 "record_id": f"R{index}",
@@ -43,6 +45,18 @@ def instances(rows) -> pd.DataFrame:
             "country_ambiguous", "extraction_error", "reference_status", "needs_hitl",
         ],
     )
+    return frame
+
+
+def evaluated(rows) -> pd.DataFrame:
+    """Instance frame carrying labels: (town_ok, country_ok, cross_entropy)."""
+    base = instances([(0.9, "both_explicit", False, False)] * len(rows))
+    base["town_exists_ok"] = pd.Series([row[0] for row in rows], dtype="boolean")
+    base["country_exists_ok"] = pd.Series([row[1] for row in rows], dtype="boolean")
+    base["cross_entropy"] = pd.to_numeric(
+        pd.Series([row[2] for row in rows]), errors="coerce"
+    )
+    return base
 
 
 class TestBandLabels:
@@ -384,15 +398,31 @@ class TestExecutiveSummary:
         summary = build_executive_summary(
             result.metrics, result.instances, threshold=0.90
         )
-        values = json.dumps(
-            [value for value in summary.values() if isinstance(value, str)]
-        ).upper()
+        # Operator-chosen metadata (model, prompt version, reference version) is
+        # excluded: those labels are named by humans and may legitimately contain
+        # a word that also appears in a test address.
+        values = json.dumps(data_derived_strings(summary)).upper()
 
         for fragment in (
             "LINCOLN", "BOSTON", "GREENWICH", "ACCRA", "AUCKLAND", "JIRON",
             "AERONAUTICA", "TAIPEI", "02111", "10013",
         ):
             assert fragment not in values, f"{fragment} leaked into the summary"
+
+    def test_operator_metadata_is_excluded_from_the_privacy_scan(self):
+        """A prompt version named after a test case is not an address leak."""
+        summary = build_executive_summary(
+            {
+                "run": {"prompt_version": "v5-greenwich-json-regression",
+                        "model": "gemini-3.5-flash", "mode": "live"},
+                "reference_data": {"town_country": {}}, "shape": {}, "pass1": {},
+                "efficiency": {}, "outcomes": {},
+            },
+            instances([(0.97, "both_explicit", False, False)]),
+            threshold=0.90,
+        )
+        assert summary["prompt_version"] == "v5-greenwich-json-regression"
+        assert "GREENWICH" not in json.dumps(data_derived_strings(summary)).upper()
 
     def test_record_identifiers_do_not_appear(
         self, config, group_config, reference_provider, mock_client, sample_input_path
@@ -474,6 +504,99 @@ class TestWriteReports:
         assert len(reloaded) == 9
         summary = json.loads(report.paths["executive_summary"].read_text())
         assert summary["non_empty_address_instances"] == 1
+
+
+class TestCrossEntropySummary:
+    """Calibration reporting: grounded observations only, lower is better."""
+
+    def _value(self, frame, metric):
+        return dict(zip(frame["metric"], frame["value"]))[metric]
+
+    def test_ungrounded_rows_are_excluded_from_the_denominator(self):
+        summary = build_cross_entropy_summary(
+            evaluated([
+                (True, True, 0.02),
+                (True, False, 2.99),
+                (None, None, None),      # reference gap — must not enter the loss
+                (None, None, None),
+            ])
+        )
+        assert self._value(summary, "Non-empty instances") == 4
+        assert self._value(summary, "Grounded observations") == 2
+        assert self._value(summary, "Ungrounded (excluded from loss)") == 2
+
+    def test_mean_median_p95_use_grounded_rows_only(self):
+        summary = build_cross_entropy_summary(
+            evaluated([
+                (True, True, 0.02),
+                (True, True, 0.04),
+                (None, None, None),
+            ])
+        )
+        assert self._value(summary, "Mean cross-entropy") == pytest.approx(0.03)
+        assert self._value(summary, "Median cross-entropy") == pytest.approx(0.03)
+        assert self._value(summary, "P95 cross-entropy") == pytest.approx(0.039, abs=1e-3)
+
+    def test_correctness_rates_use_their_own_denominators(self):
+        summary = build_cross_entropy_summary(
+            evaluated([
+                (True, True, 0.02),
+                (True, False, 2.99),
+                (False, None, 2.99),
+                (None, None, None),
+            ])
+        )
+        # Town: 3 labelled, 2 correct. Country: 2 labelled, 1 correct.
+        assert self._value(summary, "Town correctness rate") == pytest.approx(66.67)
+        assert self._value(summary, "Country correctness rate") == pytest.approx(50.0)
+
+    def test_denominators_are_labelled_distinctly(self):
+        summary = build_cross_entropy_summary(
+            evaluated([(True, True, 0.02), (False, None, 2.99)])
+        )
+        denominators = dict(zip(summary["metric"], summary["denominator"]))
+        assert "lower is better" in denominators["Mean cross-entropy"]
+        assert denominators["Town correctness rate"].endswith("town-grounded instances")
+
+    def test_fully_ungrounded_input_reports_nothing_rather_than_zero_loss(self):
+        summary = build_cross_entropy_summary(
+            evaluated([(None, None, None), (None, None, None)])
+        )
+        assert self._value(summary, "Grounded observations") == 0
+        assert self._value(summary, "Mean cross-entropy") is None
+
+    def test_empty_input(self):
+        summary = build_cross_entropy_summary(pd.DataFrame())
+        assert self._value(summary, "Grounded observations") == 0
+
+    def test_written_as_a_report_artifact(self, config):
+        report = write_reports(
+            {"run": {}, "reference_data": {}, "shape": {}, "pass1": {},
+             "efficiency": {}, "outcomes": {}},
+            evaluated([(True, True, 0.02)]),
+            config,
+        )
+        assert report.paths["cross_entropy_summary"].exists()
+        reloaded = pd.read_csv(report.paths["cross_entropy_summary"])
+        assert "Mean cross-entropy" in set(reloaded["metric"])
+
+    def test_real_run_produces_a_grounded_summary(
+        self, config, group_config, reference_provider, town_country_provider,
+        mock_client, sample_input_path,
+    ):
+        from swift_address.io import read_input_csv
+        from swift_address.pipeline import Phase1Pipeline
+
+        result = Phase1Pipeline(
+            config, group_config, client=mock_client,
+            reference_provider=reference_provider,
+            town_country_provider=town_country_provider, mode="dry_run",
+        ).run(read_input_csv(sample_input_path))
+
+        summary = build_cross_entropy_summary(result.instances)
+        assert self._value(summary, "Non-empty instances") == 7
+        assert self._value(summary, "Grounded observations") >= 1
+        assert self._value(summary, "Mean cross-entropy") is not None
 
 
 class TestHistogram:

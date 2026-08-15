@@ -11,18 +11,20 @@ This starter is intentionally notebook-first, but the implementation should plac
 2. The screenshot group-config shows 15 groups. The input-schema screenshot includes one additional unmapped group: `PRI_SNDR_CORR_ADDR_LINE_1..3`. The sample configuration therefore keeps the screenshot mappings as groups 1–15 and adds `PRI_SNDR_CORR` as **group16**. This should be confirmed against the authoritative project config before production use.
 3. There are **11 requested output columns per group**. Therefore 16 × 11 = **176 appended columns**, and a 50-column input becomes **226 columns**, not 236. The code must calculate this dynamically and never hard-code 226.
 
-   > **Superseded — the arithmetic, not the principle.** `predicted_country_name_group_{id}` was
-   > added later, making it **12** fields per group: 16 × 12 = **192 appended columns** and
-   > **242** total for a 50-column input. The requirement that the count be *calculated* rather
-   > than hard-coded still holds and is enforced by `OUTPUT_FIELD_KEYS`.
+   > **Superseded — the arithmetic, not the principle.** Later iterations appended
+   > `predicted_country_name`, then the ground-truth, cross-entropy and retraction fields,
+   > reaching **17** fields per group: 16 × 17 = **272 appended columns** and **322** total for a
+   > 50-column input. The requirement that the count be *calculated* rather than hard-coded still
+   > holds and is enforced by `OUTPUT_FIELD_KEYS`.
 4. The user-supplied field names contained likely spelling typos (`comined`, `countrty`, `rational`). The new implementation should use canonical spellings (`combined`, `country`, `rationale`) by default. A naming-template config should make legacy names possible if downstream compatibility requires them.
 
 ## Phase 1 scope
 
 - Input: CSV.
 - Group configuration: CSV or YAML; the supplied sample uses CSV.
-- Output: CSV preserving every input column and appending 11 columns for each configured group.
-- Notebook: `notebooks/01_phase1_address_extraction.ipynb`.
+- Output: CSV preserving every input column and appending the configured columns for each group
+  (17 today), plus a nested detailed JSONL for audit and evaluation depth.
+- Notebooks: `notebooks/01_phase1_address_extraction_DRY_RUN.ipynb` and `..._ACTUAL_RUN.ipynb`.
 - Gemini model: configurable environment variable; default `gemini-3.5-flash`.
 - Credentials: environment variables only; never hard-code secrets in notebooks, source code, YAML, or committed files.
 - Structured JSON output from Gemini.
@@ -51,15 +53,151 @@ For `group15`, the canonical names are:
 
 The same template is generated for every configured group. Do not hard-code group IDs.
 
+plus five fields added for ground-truth validation, evaluation, and retraction — **appended**, so no
+pre-existing column position shifts:
+
+13. `town_exists_ok_group_15`
+14. `country_exists_ok_group_15`
+15. `cross_entropy_group_15`
+16. `combined_address_retracted_group_15`
+17. `combined_address_retracted_group_comments_15`
+
 `predicted_country_name_*` is **deterministic reference-derived output**, not a second model
 prediction: Python expands `predicted_country_*` through the ISO 3166-1 layer. The two columns stay
 aligned element for element, so `CA,US` pairs with `Canada,United States`, a single code yields a
 single name, and `NO_COUNTRY` yields `NO_COUNTRY`. The response schema has no country-name field for
 the model to fill in.
 
-**12 fields per group** → 16 groups append 192 columns, and a 50-column input becomes **242**
+**17 fields per group** → 16 groups append 272 columns, and a 50-column input becomes **322**
 columns. As before, this is calculated from `OUTPUT_FIELD_KEYS` and the enabled group count; nothing
 in the code hard-codes it.
+
+### `predicted_*_exists` versus `*_exists_ok`
+
+These two families look similar and mean different things. Keeping them apart is what lets the
+evaluation metric stay honest.
+
+| Field | Question | Type |
+|---|---|---|
+| `predicted_town_exists_*` | is the predicted Town **explicitly present in the input text**? | boolean |
+| `predicted_country_exists_*` | is the predicted Country explicitly present in the input text? | boolean |
+| `town_exists_ok_*` | when independent evidence exists, **was the prediction correct**? | **nullable** boolean |
+| `country_exists_ok_*` | same, for Country | **nullable** boolean |
+
+The meaning of `predicted_*_exists` is unchanged. `*_exists_ok` has three states:
+
+```text
+True   evidence is available and supports the prediction
+False  evidence is available and contradicts the prediction
+blank  evidence is insufficient, unavailable, unresolved, or ambiguous
+```
+
+**"Not found in the reference" is blank, never False.** Unknown is not the same as incorrect, and
+collapsing the two would manufacture model errors out of reference-coverage gaps — and then feed
+them into the loss. Stored as pandas `BooleanDtype`; JSON `true` / `false` / `null`.
+
+The two can legitimately disagree. A Country the model inferred is `predicted_country_exists=False`
+(it genuinely is not in the text) while `country_exists_ok=True` (a single-country reference town
+confirms it): the address did not state it, but the model was right.
+
+Ground-truth rules, conservative by design:
+
+* **Town `True`** needs the town explicitly present on token boundaries **and** known to the
+  Town/Country reference. Neither alone suffices — looking the model's own answer up in a gazetteer
+  would be circular ground truth.
+* **Town `False`** only on positive contradiction: the model asserted an explicit town that
+  token-boundary verification proves is absent (the `AERONAUTICA` → `RONA` case).
+* **Country `True`** when explicitly supported in the address, or when a reference-known town
+  resolves to exactly one country and the prediction matches it.
+* **Country `False`** only when deterministic reference truth contradicts the prediction.
+* A multi-country town with no explicit resolution is **`null`**, never `False`.
+
+### Two metrics, opposite directions
+
+| Metric | Question | Direction |
+|---|---|---|
+| `composite_weighted_score_*` | should this be auto-accepted? | **higher is better** |
+| `cross_entropy_*` | did the model's confidence match reality? | **lower is better** |
+
+Cross-entropy is binary log loss of each confidence against the correctness label:
+
+```text
+BCE(y, p) = -( y*log(p) + (1-y)*log(1-p) )     p clipped to [1e-6, 1-1e-6]
+
+correct   at p = 0.95  ->  0.051293   (cheap)
+incorrect at p = 0.95  ->  2.995732   (expensive)
+```
+
+Both labels available → the group value is the **mean** of the two component losses. One label →
+that component's loss, status `town_only` / `country_only`. Neither → **blank**, status
+`not_available` / `reference_not_found` / `ambiguous_ground_truth`. Missing reference coverage is
+never scored as an artificially high loss; the observation is excluded from the metric instead.
+Component detail lives in the detailed JSON, not in more CSV columns. Gemini never computes it.
+
+The Composite Weighted Score formula and the reliability-weight matrix are **unchanged**.
+
+### Address retraction
+
+`combined_address_retracted_*` removes from the original address only the Town/Country information
+that was actually present and deterministically verified in the source text.
+
+* Town is removed only when `predicted_town_exists` is True.
+* Country is removed only when `predicted_country_exists` is True.
+* A Country that was *inferred* was never in the text, so nothing is removed — it stays a prediction.
+
+Removal is **token-span based, never substring replacement**, and it happens at the **original
+source-column level**: each configured field is processed independently, then the retracted combined
+address is rebuilt from the after-values using the same Pass 1 conventions. The original input
+columns are never modified.
+
+Safety properties, all tested: `AERONAUTICA` cannot lose `RONA`; `CUSTOMS` cannot lose `US`; an
+ambiguous code such as `IN` is removed only where country verification concluded it really meant
+India — and that trailing-position judgement is made against the **combined** address, because a
+token sitting mid-address can be in the trailing window of its own short field. Repeated standalone
+occurrences are all removed (`CITIGROUP CENTRE AUCKLAND AUCKLAND` → `CITIGROUP CENTRE`); postal codes
+survive (`1140 NZ` → `1140`); surviving text keeps its original casing.
+
+Example:
+
+```text
+before  LINE_1  23 CUSTOMS STREET EAST LEVEL 11
+        LINE_2  CITIGROUP CENTRE AUCKLAND AUCKLAND
+        LINE_3  1140 NZ
+
+after   LINE_1  23 CUSTOMS STREET EAST LEVEL 11
+        LINE_2  CITIGROUP CENTRE
+        LINE_3  1140
+
+combined_address_retracted = "23 CUSTOMS STREET EAST LEVEL 11 CITIGROUP CENTRE 1140"
+comment = "Retracted Town=AUCKLAND and Country=NZ from verified explicit address evidence."
+```
+
+The comment is generated deterministically in Python (never by the model) and is at most three
+lines, usually one. Per-column before/after detail lives in the detailed JSON.
+
+### Detailed nested output
+
+The CSV remains the flat compatibility artifact for spreadsheets and downstream flat-file consumers.
+Audit and evaluation depth lives in `outputs/phase1_detailed_output.jsonl` — one JSON object per
+input record, every enabled group nested inside — rather than growing dozens more columns.
+
+```yaml
+processing:
+  detailed_json_enabled: true
+  detailed_json_path: "outputs/phase1_detailed_output.jsonl"
+  detailed_json_format: "jsonl"     # "jsonl" (default) | "json" (small dev runs)
+```
+
+Per group: `source_fields`, `address`, `prediction`, `text_evidence`,
+`ground_truth_validation`, `scoring`, `cross_entropy`, `rationale`, and `retraction` (with
+`actual_column_before_retraction` / `actual_column_after_retraction`). Null-skipped groups appear
+with `"status": "null_skip"` and a lean body. Run-wide metadata is *not* repeated per group — it
+belongs in `run_metrics.json` and `executive_summary.json`.
+
+The writer **streams**: one record is built, serialized, and written before the next is touched, so
+peak memory is a single record. Unavailable numerics serialize as `null`; `allow_nan=False` makes
+emitting the invalid token `NaN` impossible. The file contains raw address data and is therefore
+sensitive — it stays under git-ignored `outputs/`.
 
 ## Null-address first pass
 
@@ -311,7 +449,7 @@ result = run_phase1("data/sample_input.csv", config, group_config,
 ### Tests
 
 ```bash
-python -m pytest          # 325 tests
+python -m pytest          # 438 tests
 ```
 
 Tests never read the real Town/Country reference file. `tests/conftest.py` repoints
@@ -327,7 +465,8 @@ parent directories, so deleting the tree is safe.
 
 | Path | Contents | Raw addresses |
 |---|---|---|
-| `outputs/phase1_output.csv` | every input column unchanged + 12 columns per enabled group | **Yes** |
+| `outputs/phase1_output.csv` | every input column unchanged + 17 columns per enabled group | **Yes** |
+| `outputs/phase1_detailed_output.jsonl` | nested per-record detail (streamed JSON Lines) | **Yes** |
 | `outputs/address_cache.jsonl` | cached extractions + audit metadata | **Yes** |
 | `outputs/processing_errors.csv` | one row per failed unique address, referenced by SHA-256 | No |
 | `outputs/run_metrics.json` | shape, savings, cache/call counts, scenario counts, HITL counts, reference-data provenance | No |
@@ -335,6 +474,7 @@ parent directories, so deleting the tree is safe.
 | `outputs/reports/score_distribution.csv` | composite-score bands over non-empty instances | No |
 | `outputs/reports/scenario_distribution.csv` | policy-scenario mix | No |
 | `outputs/reports/threshold_sensitivity.csv` | routing volume at each candidate threshold | No |
+| `outputs/reports/cross_entropy_summary.csv` | calibration over grounded observations only | No |
 | `outputs/charts/composite_score_histogram.png` | the score distribution as a chart | No |
 
 ### Town/Country reference data (external runtime dependency)
@@ -472,8 +612,9 @@ scripts/build_geonames_town_country_reference.py   builds the above from GeoName
 prompts/GEMINI_EXTRACTION_PROMPT.md    single source of the prompt text
 notebooks/01_phase1_address_extraction.ipynb
 src/swift_address/                     settings, io, grouping, cleaning, schemas, reference_data,
-                                       gemini_client, scoring, cache, pipeline, reporting
-tests/                                 325 tests covering the acceptance criteria
+                                       gemini_client, scoring, evaluation, retraction, cache,
+                                       pipeline, reporting, serialization
+tests/                                 438 tests covering the acceptance criteria
 tests/fixtures/                        tiny Town/Country fixture used instead of the real file
 outputs/                               generated; git-ignored except outputs/README.md
 ```

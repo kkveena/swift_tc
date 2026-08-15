@@ -34,7 +34,10 @@ import pandas as pd
 __all__ = [
     "BELOW_FIRST_BAND_LABEL",
     "ExecutiveReport",
+    "OPERATOR_METADATA_KEYS",
+    "data_derived_strings",
     "band_labels",
+    "build_cross_entropy_summary",
     "build_executive_summary",
     "build_kpi_table",
     "build_scenario_distribution",
@@ -59,6 +62,38 @@ _SURFACE = "#fcfcfb"
 _INK_PRIMARY = "#0b0b0b"
 _INK_SECONDARY = "#52514e"
 _GRID = "#dcdbd6"
+
+
+#: Executive-summary fields whose text the *operator* chooses — model IDs, prompt
+#: and reference version labels, timestamps, fixed prose. None is derived from
+#: input data, so a privacy scan must skip them. Without this, a prompt version
+#: named after a test case ("v5-greenwich-json-regression") reads as an address
+#: leak when the address it was named for is nowhere near the file.
+OPERATOR_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        "run_timestamp",
+        "mode",
+        "model",
+        "prompt_version",
+        "reference_data_version",
+        "town_country_reference_version",
+        "threshold_basis",
+    }
+)
+
+
+def data_derived_strings(summary: Mapping[str, Any]) -> list[str]:
+    """String values in the summary that are *not* operator-chosen metadata.
+
+    This is what a privacy check should scan. The executive summary is built
+    from aggregate counts plus run metadata, so this list should be empty — the
+    scan is belt and braces against a future field carrying data through.
+    """
+    return [
+        value
+        for key, value in summary.items()
+        if isinstance(value, str) and key not in OPERATOR_METADATA_KEYS
+    ]
 
 
 def band_labels(edges: Sequence[float]) -> tuple[str, ...]:
@@ -212,6 +247,85 @@ def build_threshold_sensitivity(
             }
         )
     return pd.DataFrame(rows)
+
+
+def build_cross_entropy_summary(instances: pd.DataFrame) -> pd.DataFrame:
+    """Calibration summary over *grounded* observations only.
+
+    Cross-entropy answers a different question from the Composite Weighted
+    Score, and in the opposite direction:
+
+    * Composite Weighted Score — operational routing — **higher is better**.
+    * Cross-entropy — did confidence match reality — **lower is better**.
+
+    Only observations with the relevant ground truth available enter the
+    denominator. An instance the reference could not label is *excluded*, not
+    counted as a miss: a coverage gap is not a model error, and letting it
+    inflate the loss would make the metric say something untrue.
+    """
+    frame = _non_empty(instances)
+    total = len(frame)
+
+    if total == 0 or "cross_entropy" not in frame.columns:
+        return pd.DataFrame(
+            [
+                {"metric": "Non-empty instances", "value": total,
+                 "denominator": "instances"},
+                {"metric": "Grounded observations", "value": 0,
+                 "denominator": "instances with any ground truth"},
+            ]
+        )
+
+    losses = pd.to_numeric(frame["cross_entropy"], errors="coerce").dropna()
+    town = _correctness(frame, "town_exists_ok")
+    country = _correctness(frame, "country_exists_ok")
+
+    rows: list[dict[str, Any]] = [
+        {"metric": "Non-empty instances", "value": total, "denominator": "instances"},
+        {"metric": "Grounded observations", "value": int(len(losses)),
+         "denominator": "instances with any ground truth"},
+        {"metric": "Ungrounded (excluded from loss)", "value": int(total - len(losses)),
+         "denominator": "instances"},
+        {"metric": "Mean cross-entropy", "value": _stat(losses.mean()),
+         "denominator": "grounded observations — lower is better"},
+        {"metric": "Median cross-entropy", "value": _stat(losses.median()),
+         "denominator": "grounded observations — lower is better"},
+        {"metric": "P95 cross-entropy",
+         "value": _stat(losses.quantile(0.95)) if len(losses) else None,
+         "denominator": "grounded observations — lower is better"},
+        {"metric": "Town correctness rate", "value": town[0],
+         "denominator": f"{town[1]} town-grounded instances"},
+        {"metric": "Country correctness rate", "value": country[0],
+         "denominator": f"{country[1]} country-grounded instances"},
+    ]
+    return pd.DataFrame(
+        {
+            "metric": [row["metric"] for row in rows],
+            "value": pd.Series([row["value"] for row in rows], dtype=object),
+            "denominator": [row["denominator"] for row in rows],
+        }
+    )
+
+
+def _correctness(frame: pd.DataFrame, column: str) -> tuple[float | None, int]:
+    """(percent correct, grounded count) for one nullable label column."""
+    if column not in frame.columns:
+        return None, 0
+    labels = frame[column].dropna()
+    if labels.empty:
+        return None, 0
+    correct = int(labels.astype(bool).sum())
+    return round(100.0 * correct / len(labels), 2), int(len(labels))
+
+
+def _stat(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+    return None if pd.isna(numeric) else round(numeric, 6)
 
 
 def build_kpi_table(
@@ -438,6 +552,7 @@ class ExecutiveReport:
     score_distribution: pd.DataFrame
     scenario_distribution: pd.DataFrame
     threshold_sensitivity: pd.DataFrame
+    cross_entropy_summary: pd.DataFrame
     executive_summary: dict[str, Any]
     paths: dict[str, Path]
 
@@ -466,6 +581,7 @@ def write_reports(
     sensitivity = build_threshold_sensitivity(
         instances, reporting.sensitivity_thresholds
     )
+    cross_entropy = build_cross_entropy_summary(instances)
     summary = build_executive_summary(metrics, instances, threshold=effective_threshold)
 
     reports_dir = config.path(reporting.reports_dir)
@@ -481,6 +597,9 @@ def write_reports(
     )
     paths["threshold_sensitivity"] = _write_csv(
         sensitivity, reports_dir / reporting.threshold_sensitivity_filename
+    )
+    paths["cross_entropy_summary"] = _write_csv(
+        cross_entropy, reports_dir / reporting.cross_entropy_summary_filename
     )
 
     summary_path = reports_dir / reporting.executive_summary_filename
@@ -504,6 +623,7 @@ def write_reports(
         score_distribution=distribution,
         scenario_distribution=scenarios,
         threshold_sensitivity=sensitivity,
+        cross_entropy_summary=cross_entropy,
         executive_summary=summary,
         paths=paths,
     )

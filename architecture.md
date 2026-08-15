@@ -93,9 +93,12 @@ swift-address-extraction/
 │       ├── reference_data.py
 │       ├── gemini_client.py
 │       ├── scoring.py
+│       ├── evaluation.py          # nullable ground truth + cross-entropy
+│       ├── retraction.py          # deterministic evidence removal
 │       ├── cache.py
 │       ├── pipeline.py
-│       └── reporting.py
+│       ├── reporting.py
+│       └── serialization.py       # streaming nested detail (JSONL)
 ├── tests/
 │   ├── test_grouping.py
 │   ├── test_cleaning.py
@@ -138,9 +141,10 @@ For `G` groups and `K` group-output fields (`K = len(OUTPUT_FIELD_KEYS)`):
 
 `final_column_count = input_column_count + G * K`
 
-`K` is **12** since the addition of `predicted_country_name_group_{id}`, so for 50 input columns and
-16 groups: `50 + 16*12 = 242`. The count is always derived from the field tuple and the enabled
-group count; no module hard-codes it.
+`K` is **17** — the original 11, plus `predicted_country_name`, plus the five ground-truth /
+evaluation / retraction fields — so for 50 input columns and 16 groups: `50 + 16*17 = 322`. The count
+is always derived from the field tuple and the enabled group count; no module hard-codes it. The five
+newest fields are *appended* rather than interleaved, so no pre-existing column position moved.
 
 ## 6. Pass 1 — deterministic preprocessing
 
@@ -257,6 +261,68 @@ guess into the prompt would invite the model to cite reference data the program 
 findings are applied post-extraction in `scoring.verify_extraction` instead, under a fixed precedence
 (explicit address evidence → gap fill → escalation) documented in README "Implementation decisions".
 
+## 9a. Validation, evaluation, and retraction
+
+Three deterministic layers run *after* extraction, in this order. All three are pure Python; none
+calls a model.
+
+```text
+verify_extraction        -> predicted_*_exists   (explicit presence in the input text)
+evaluate_ground_truth    -> *_exists_ok          (nullable correctness label)
+compute_cross_entropy    -> cross_entropy        (log loss of confidence vs label)
+retract_group            -> combined_address_retracted (+ per-column before/after)
+```
+
+### Two field families, two questions
+
+`predicted_*_exists` is unchanged: *is the predicted value explicitly present in the input text?*
+
+`*_exists_ok` is new and different: *when independent deterministic evidence is available, was the
+prediction correct?* It is a **nullable** boolean — `True` / `False` / unknown. "Not found in the
+reference" is unknown, never `False`; treating a coverage gap as a wrong answer would inject
+fabricated errors straight into the loss.
+
+Town `True` requires two independent things to agree — explicit token-boundary presence in the
+address *and* the town being known to the reference. Requiring only the second would be circular:
+looking the model's own answer up in a gazetteer proves nothing about whether it belongs to *this*
+address.
+
+### Two metrics, opposite directions
+
+```text
+composite_weighted_score   operational HITL routing        HIGHER is better
+cross_entropy              confidence calibration vs truth LOWER  is better
+```
+
+Cross-entropy is an evaluation metric, deliberately kept out of routing. The Composite Weighted Score
+formula and the reliability-weight matrix are unchanged by its introduction.
+
+### Retraction
+
+Retraction removes only verified evidence, on token spans, at the **original source-column level**;
+the retracted combined address is then rebuilt from the after-values through the same Pass 1
+`build_combined_address` used everywhere else, rather than being reverse-engineered from a mutated
+combined string. Source columns are read, never written.
+
+The ambiguous-alpha2 trailing-position rule is evaluated against the **combined** address, not the
+individual field: a token in the middle of an address can sit inside the trailing window of its own
+short field, which would otherwise strip the preposition out of "SUITE 5 IN TOWER".
+
+## 9b. Output surfaces
+
+```text
+phase1_output.csv              flat compatibility artifact (17 fields/group)
+phase1_detailed_output.jsonl   nested per-record audit + evaluation depth (streamed)
+run_metrics.json               run-wide shape, savings, provenance, status counts
+reports/*.csv, charts/*.png    executive reporting
+processing_errors.csv          failed unique addresses, referenced by hash
+```
+
+The CSV stays for spreadsheet review and downstream flat-file consumers. New audit detail goes to
+the nested JSON rather than adding further columns. The JSONL writer streams one record at a time,
+so peak memory is a single record regardless of dataset size, and run-wide metadata is not repeated
+inside every group.
+
 ### Where BIC/SWIFTRef plugs in later
 
 The Town/Country provider establishes the shape a Phase 2 BIC layer follows:
@@ -264,8 +330,15 @@ The Town/Country provider establishes the shape a Phase 2 BIC layer follows:
 ```text
 BIC code -> SwiftRefProvider (entitled API or licensed directory file)
          -> authoritative institution address
+         -> Town + Country ground truth
          -> the same post-extraction validation slot in verify_extraction
+         -> *_exists_ok labels -> cross-entropy / calibration
 ```
+
+The evaluation layer is already shaped for this. `evaluate_ground_truth` consumes a provider and
+emits nullable labels; a SWIFTRef-derived label is simply a better-grounded source than the
+development gazetteer, so the loss becomes meaningful on a larger share of rows without the metric,
+the scoring engine, or the pipeline changing. **Not implemented in this phase.**
 
 No pipeline change is needed to add it: a provider is constructed from config, injected into
 `Phase1Pipeline`, and consulted after extraction. `SwiftRefProvider` stays an honest stub that raises
