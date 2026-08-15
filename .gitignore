@@ -157,6 +157,13 @@ ENV/
 env.bak/
 venv.bak/
 
+# Generated local reference data
+# Keep these files on disk for local use only; do not commit them.
+data/reference/*.csv
+data/reference/*.csv.gz
+data/reference/*.zip
+data/reference/*.txt
+
 # Spyder project settings
 .spyderproject
 .spyproject
