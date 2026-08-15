@@ -36,10 +36,22 @@ def run_result(config, group_config, reference_provider, mock_client, sample_inp
 
 
 class TestColumnArithmetic:
-    def test_eleven_fields_per_group(self):
-        assert len(OUTPUT_FIELD_KEYS) == 11
+    def test_twelve_fields_per_group(self, config):
+        """11 original fields + the deterministic country-name expansion."""
+        assert len(OUTPUT_FIELD_KEYS) == 12
+        assert config.fields_per_group == 12
 
-    def test_sixteen_groups_append_exactly_176_columns(
+    def test_country_name_sits_directly_after_country_code(self, config):
+        keys = list(OUTPUT_FIELD_KEYS)
+        assert keys.index("predicted_country_name") == keys.index("predicted_country") + 1
+
+        names = list(config.group_column_names("15"))
+        assert (
+            names.index("predicted_country_name_group_15")
+            == names.index("predicted_country_group_15") + 1
+        )
+
+    def test_sixteen_groups_append_exactly_192_columns(
         self, config, group_config, run_result, sample_input_path
     ):
         from swift_address.io import read_input_csv
@@ -50,11 +62,11 @@ class TestColumnArithmetic:
 
         assert appended == expected
         assert len(group_config.enabled_groups) == 16
-        assert appended == 176
+        assert appended == 192       # 16 x 12
 
-    def test_fifty_column_input_becomes_226_columns(self, run_result):
+    def test_fifty_column_input_becomes_242_columns(self, run_result):
         assert run_result.metrics["shape"]["input_columns"] == 50
-        assert len(run_result.frame.columns) == 226
+        assert len(run_result.frame.columns) == 242      # 50 + 16 x 12
 
     def test_count_is_derived_not_hard_coded(self, config, group_config, run_result):
         shape = run_result.metrics["shape"]
@@ -66,7 +78,7 @@ class TestColumnArithmetic:
     def test_a_different_group_count_changes_the_arithmetic(
         self, config, reference_provider, mock_client, tmp_path
     ):
-        """Three groups append 33 columns. Nothing in the code assumes 16."""
+        """Three groups append 3 x 12 columns. Nothing in the code assumes 16."""
         from swift_address.grouping import load_group_config
 
         group_path = tmp_path / "groups.csv"
@@ -87,7 +99,7 @@ class TestColumnArithmetic:
             mode="dry_run",
         )
         result = pipeline.run(frame)
-        assert len(result.frame.columns) == 7 + 3 * 11 == 40
+        assert len(result.frame.columns) == 7 + 3 * config.fields_per_group == 43
 
     def test_no_accidental_extra_columns(self, config, group_config, run_result, sample_input_path):
         from swift_address.io import read_input_csv
@@ -145,7 +157,10 @@ class TestLegacyNamingStyle:
         columns = set(result.frame.columns)
         assert "comined_address_group_15" in columns
         assert "combined_address_group_15" not in columns
-        assert len(result.frame.columns) == 1 + len(group_config.all_source_fields) + 176
+        assert "predicted_countrty_name_group_15" in columns
+        assert len(result.frame.columns) == (
+            1 + len(group_config.all_source_fields) + 16 * config.fields_per_group
+        )
 
 
 class TestInputPreservation:

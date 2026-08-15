@@ -34,9 +34,19 @@ def sample_input_path(repo_root: Path) -> Path:
     return repo_root / "data" / "sample_input.csv"
 
 
+@pytest.fixture(scope="session")
+def town_country_fixture_path(repo_root: Path) -> Path:
+    """The tiny committed Town/Country fixture.
+
+    Tests never touch the real reference file: it is a large, environment-
+    specific external dependency that is not in version control.
+    """
+    return repo_root / "tests" / "fixtures" / "town_country_reference_test.csv"
+
+
 @pytest.fixture
-def config(repo_root: Path, tmp_path: Path):
-    """Repository config with all output paths redirected into tmp_path."""
+def config(repo_root: Path, tmp_path: Path, town_country_fixture_path: Path):
+    """Repository config with outputs redirected and the reference file stubbed."""
     return load_config(
         repo_root / "config" / "config.yaml",
         base_dir=repo_root,
@@ -46,7 +56,14 @@ def config(repo_root: Path, tmp_path: Path):
                 "errors_path": str(tmp_path / "processing_errors.csv"),
                 "metrics_path": str(tmp_path / "run_metrics.json"),
                 "output_path": str(tmp_path / "phase1_output.csv"),
-            }
+            },
+            "reporting": {
+                "reports_dir": str(tmp_path / "reports"),
+                "charts_dir": str(tmp_path / "charts"),
+            },
+            "reference_data": {
+                "town_country_path": str(town_country_fixture_path),
+            },
         },
     )
 
@@ -66,6 +83,13 @@ def iso_provider(reference_provider):
     from swift_address.reference_data import find_iso_provider
 
     return find_iso_provider(reference_provider)
+
+
+@pytest.fixture
+def town_country_provider(config):
+    from swift_address.reference_data import build_town_country_provider
+
+    return build_town_country_provider(config.reference_data, base_dir=config.base_dir)
 
 
 @pytest.fixture

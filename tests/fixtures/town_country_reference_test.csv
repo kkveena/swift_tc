@@ -1,0 +1,18 @@
+town_name,town_name_normalized,country_code,country_name,source_dataset,source_version,source_url,approved_for_production
+Boston,BOSTON,US,United States,test_fixture,test-1,fixture://tests,false
+Boston,BOSTON,GB,United Kingdom,test_fixture,test-1,fixture://tests,false
+New York,NEW YORK,US,United States,test_fixture,test-1,fixture://tests,false
+Lima,LIMA,PE,Peru,test_fixture,test-1,fixture://tests,false
+Lima,LIMA,US,United States,test_fixture,test-1,fixture://tests,false
+Accra,ACCRA,GH,Ghana,test_fixture,test-1,fixture://tests,false
+Auckland,AUCKLAND,NZ,New Zealand,test_fixture,test-1,fixture://tests,false
+Taipei,TAIPEI,TW,Taiwan,test_fixture,test-1,fixture://tests,false
+Hamilton,HAMILTON,BM,Bermuda,test_fixture,test-1,fixture://tests,false
+Hamilton,HAMILTON,CA,Canada,test_fixture,test-1,fixture://tests,false
+Hamilton,HAMILTON,NZ,New Zealand,test_fixture,test-1,fixture://tests,false
+London,LONDON,GB,United Kingdom,test_fixture,test-1,fixture://tests,false
+London,LONDON,CA,Canada,test_fixture,test-1,fixture://tests,false
+Saint-Denis,SAINT-DENIS,FR,France,test_fixture,test-1,fixture://tests,false
+Zurich,ZURICH,CH,Switzerland,test_fixture,test-1,fixture://tests,false
+Example_Town,EXAMPLE_TOWN,CA,Canada,test_fixture,test-1,fixture://tests,false
+Example_Town,EXAMPLE_TOWN,US,United States,test_fixture,test-1,fixture://tests,false

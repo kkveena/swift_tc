@@ -20,6 +20,9 @@ google-genai>=1.0
 # Bounded retry / exponential backoff with jitter
 tenacity>=8.2
 
+# Executive-report chart rendering (headless Agg backend; no display needed)
+matplotlib>=3.8
+
 # Local development convenience only. The code reads os.environ directly and
 # works without a .env file present.
 python-dotenv>=1.0

@@ -27,6 +27,7 @@ __all__ = [
     "ProcessingConfig",
     "ProjectConfig",
     "ReferenceDataConfig",
+    "ReportingConfig",
     "ScenarioWeights",
     "ScoringConfig",
     "OUTPUT_FIELD_KEYS",
@@ -37,14 +38,17 @@ __all__ = [
     "raw_logs_allowed",
 ]
 
-#: The 11 output fields produced for every enabled group, in CSV order.
+#: The output fields produced for every enabled group, in CSV order.
 #: Changing this tuple changes the per-group column count everywhere; nothing
-#: else in the codebase hard-codes 11.
+#: else in the codebase hard-codes the count. `predicted_country_name` sits
+#: directly after `predicted_country` and is derived deterministically from it
+#: by the ISO reference layer — the model is never asked for a country name.
 OUTPUT_FIELD_KEYS: tuple[str, ...] = (
     "combined_address",
     "combined_address_cleaned",
     "predicted_town",
     "predicted_country",
+    "predicted_country_name",
     "predicted_town_probability",
     "predicted_country_probability",
     "predicted_town_exists",
@@ -187,6 +191,21 @@ class ReferenceDataConfig(_Base):
     ambiguous_alpha2_tokens: tuple[str, ...] = ()
     trailing_country_token_window: int = 3
 
+    # -- Town/Country development reference ------------------------------
+    town_country_enabled: bool = False
+    town_country_path: str = "data/reference/town_country_reference.csv"
+    town_country_source: str = "development_local_reference"
+    town_country_approved_for_production: bool = False
+    #: Physical -> logical column mapping, for a reference file whose headers
+    #: differ from the expected schema. Empty means "use the defaults".
+    town_country_column_map: dict[str, str] = Field(default_factory=dict)
+    #: 0 = unlimited. A positive value caps how many candidate codes are written
+    #: to the CSV when reference ambiguity is escalated; the full set is always
+    #: kept in the audit payload.
+    town_country_max_candidates: int = 0
+    #: How a multi-country town name affects the result. See scoring.py.
+    town_country_ambiguity_policy: str = "escalate"
+
     @field_validator("provider")
     @classmethod
     def _known_provider(cls, value: str) -> str:
@@ -197,12 +216,61 @@ class ReferenceDataConfig(_Base):
             )
         return value
 
+    @field_validator("town_country_ambiguity_policy")
+    @classmethod
+    def _known_policy(cls, value: str) -> str:
+        if value not in {"escalate", "annotate"}:
+            raise ValueError(
+                "reference_data.town_country_ambiguity_policy must be 'escalate' "
+                f"or 'annotate', got {value!r}"
+            )
+        return value
+
     @field_validator("ambiguous_alpha2_tokens", mode="before")
     @classmethod
     def _upper(cls, value: Any) -> Any:
         if value is None:
             return ()
         return tuple(str(token).strip().upper() for token in value)
+
+
+class ReportingConfig(_Base):
+    """Executive-report output paths and the score-distribution band edges."""
+
+    enabled: bool = True
+    reports_dir: str = "outputs/reports"
+    charts_dir: str = "outputs/charts"
+    executive_summary_filename: str = "executive_summary.json"
+    score_distribution_filename: str = "score_distribution.csv"
+    threshold_sensitivity_filename: str = "threshold_sensitivity.csv"
+    scenario_distribution_filename: str = "scenario_distribution.csv"
+    histogram_filename: str = "composite_score_histogram.png"
+    #: Lower edges of the score bands. Each band is [edge, next_edge), and the
+    #: final band is closed at 1.0 so a perfect score is never dropped.
+    score_band_edges: tuple[float, ...] = (0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
+    #: Thresholds evaluated by the HITL sensitivity table.
+    sensitivity_thresholds: tuple[float, ...] = (0.80, 0.85, 0.90, 0.95)
+    #: Provisional routing recommendation surfaced by the report. Not calibrated
+    #: accuracy — see SCORING_SPEC.md.
+    recommended_threshold: float = 0.90
+
+    @model_validator(mode="after")
+    def _validate_edges(self) -> "ReportingConfig":
+        if not self.score_band_edges:
+            raise ValueError("reporting.score_band_edges must not be empty")
+        edges = list(self.score_band_edges)
+        if edges != sorted(edges) or len(set(edges)) != len(edges):
+            raise ValueError("reporting.score_band_edges must be strictly increasing")
+        if not all(0.0 < edge < 1.0 for edge in edges):
+            raise ValueError("reporting.score_band_edges must lie strictly within (0, 1)")
+        for threshold in self.sensitivity_thresholds:
+            if not 0.0 <= threshold <= 1.0:
+                raise ValueError(
+                    f"reporting.sensitivity_thresholds entry {threshold} is outside [0, 1]"
+                )
+        if not 0.0 <= self.recommended_threshold <= 1.0:
+            raise ValueError("reporting.recommended_threshold must lie within [0, 1]")
+        return self
 
 
 class ScenarioWeights(_Base):
@@ -257,6 +325,7 @@ class AppConfig(_Base):
     model: ModelConfig = Field(default_factory=ModelConfig)
     processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
     reference_data: ReferenceDataConfig = Field(default_factory=ReferenceDataConfig)
+    reporting: ReportingConfig = Field(default_factory=ReportingConfig)
     scoring: ScoringConfig
 
     #: Directory every relative path in the config is resolved against.

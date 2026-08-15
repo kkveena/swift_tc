@@ -28,7 +28,7 @@ BL,Saint Barthélemy,Saint Barthelemy|St Barthelemy
 BM,Bermuda,
 BN,Brunei Darussalam,Brunei
 BO,Bolivia (Plurinational State of),Bolivia
-BQ,"Bonaire, Sint Eustatius and Saba",Bonaire|Caribbean Netherlands
+BQ,Bonaire Sint Eustatius and Saba,Bonaire|Caribbean Netherlands
 BR,Brazil,Brasil
 BS,Bahamas,The Bahamas
 BT,Bhutan,
@@ -38,7 +38,7 @@ BY,Belarus,
 BZ,Belize,
 CA,Canada,
 CC,Cocos (Keeling) Islands,Cocos Islands|Keeling Islands
-CD,"Congo, Democratic Republic of the",Democratic Republic of the Congo|DR Congo|DRC|Congo-Kinshasa
+CD,Democratic Republic of the Congo,Congo Democratic Republic of the|DR Congo|DRC|Congo-Kinshasa
 CF,Central African Republic,
 CG,Congo,Republic of the Congo|Congo-Brazzaville
 CH,Switzerland,Suisse|Schweiz|Svizzera
@@ -120,7 +120,7 @@ KI,Kiribati,
 KM,Comoros,
 KN,Saint Kitts and Nevis,St Kitts and Nevis
 KP,Korea (Democratic People's Republic of),North Korea|DPRK
-KR,"Korea, Republic of",South Korea|Republic of Korea
+KR,South Korea,Korea Republic of|Republic of Korea
 KW,Kuwait,
 KY,Cayman Islands,
 KZ,Kazakhstan,
@@ -137,7 +137,7 @@ LV,Latvia,
 LY,Libya,
 MA,Morocco,Maroc
 MC,Monaco,
-MD,"Moldova, Republic of",Moldova
+MD,Moldova,Moldova Republic of|Republic of Moldova
 ME,Montenegro,
 MF,Saint Martin (French part),Saint Martin|St Martin
 MG,Madagascar,
@@ -181,7 +181,7 @@ PL,Poland,Polska
 PM,Saint Pierre and Miquelon,
 PN,Pitcairn,
 PR,Puerto Rico,
-PS,"Palestine, State of",Palestine
+PS,State of Palestine,Palestine
 PT,Portugal,
 PW,Palau,
 PY,Paraguay,
@@ -197,7 +197,7 @@ SC,Seychelles,
 SD,Sudan,
 SE,Sweden,Sverige
 SG,Singapore,
-SH,"Saint Helena, Ascension and Tristan da Cunha",Saint Helena|St Helena
+SH,Saint Helena Ascension and Tristan da Cunha,Saint Helena|St Helena
 SI,Slovenia,
 SJ,Svalbard and Jan Mayen,
 SK,Slovakia,
@@ -226,12 +226,12 @@ TO,Tonga,
 TR,Türkiye,Turkiye|Turkey
 TT,Trinidad and Tobago,
 TV,Tuvalu,
-TW,"Taiwan, Province of China",Taiwan|Chinese Taipei
-TZ,"Tanzania, United Republic of",Tanzania
+TW,Taiwan,Taiwan Province of China|Chinese Taipei
+TZ,Tanzania,Tanzania United Republic of|United Republic of Tanzania
 UA,Ukraine,
 UG,Uganda,
 UM,United States Minor Outlying Islands,
-US,United States of America,United States|USA|U.S.A.|U.S.
+US,United States,United States of America|USA|U.S.A.|U.S.
 UY,Uruguay,
 UZ,Uzbekistan,
 VA,Holy See,Vatican|Vatican City
