@@ -49,10 +49,20 @@ def instances(rows) -> pd.DataFrame:
 
 
 def evaluated(rows) -> pd.DataFrame:
-    """Instance frame carrying labels: (town_ok, country_ok, cross_entropy)."""
+    """Instance frame carrying labels: (town_ok, country_ok, cross_entropy).
+
+    ``None`` in ``town_ok`` / ``country_ok`` means "ungrounded" for building
+    fixtures; it is translated into the plain boolean (``False``) the real
+    pipeline now writes, plus a separate ``*_grounded`` flag so correctness-rate
+    math still excludes it rather than counting it as incorrect.
+    """
     base = instances([(0.9, "both_explicit", False, False)] * len(rows))
-    base["town_exists_ok"] = pd.Series([row[0] for row in rows], dtype="boolean")
-    base["country_exists_ok"] = pd.Series([row[1] for row in rows], dtype="boolean")
+    town_ok = [row[0] for row in rows]
+    country_ok = [row[1] for row in rows]
+    base["town_exists_ok"] = [bool(v) if v is not None else False for v in town_ok]
+    base["town_grounded"] = [v is not None for v in town_ok]
+    base["country_exists_ok"] = [bool(v) if v is not None else False for v in country_ok]
+    base["country_grounded"] = [v is not None for v in country_ok]
     base["cross_entropy"] = pd.to_numeric(
         pd.Series([row[2] for row in rows]), errors="coerce"
     )

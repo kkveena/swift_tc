@@ -268,7 +268,7 @@ calls a model.
 
 ```text
 verify_extraction        -> predicted_*_exists   (explicit presence in the input text)
-evaluate_ground_truth    -> *_exists_ok          (nullable correctness label)
+evaluate_ground_truth    -> *_exists_ok          (correctness label, unknown collapses to False)
 compute_cross_entropy    -> cross_entropy        (log loss of confidence vs label)
 retract_group            -> combined_address_retracted (+ per-column before/after)
 ```
@@ -278,9 +278,10 @@ retract_group            -> combined_address_retracted (+ per-column before/afte
 `predicted_*_exists` is unchanged: *is the predicted value explicitly present in the input text?*
 
 `*_exists_ok` is new and different: *when independent deterministic evidence is available, was the
-prediction correct?* It is a **nullable** boolean — `True` / `False` / unknown. "Not found in the
-reference" is unknown, never `False`; treating a coverage gap as a wrong answer would inject
-fabricated errors straight into the loss.
+prediction correct?* It is a plain boolean — `True` / `False`, never blank. "Not found in the
+reference" collapses to `False` in this column; the distinction from a positive contradiction still
+lives in the audit trail's basis fields, and cross-entropy / correctness-rate reporting still exclude
+genuine coverage gaps from the loss rather than treating them as a wrong answer.
 
 Town `True` requires two independent things to agree — explicit token-boundary presence in the
 address *and* the town being known to the reference. Requiring only the second would be circular:

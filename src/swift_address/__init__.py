@@ -24,7 +24,7 @@ serialization   streaming nested per-record detail (JSONL)
 Two pairs of concepts are deliberately kept apart:
 
 predicted_*_exists   is the value explicitly present in the input text?
-*_exists_ok          when independent evidence exists, was it correct? (nullable)
+*_exists_ok          when independent evidence exists, was it correct? (unknown -> False)
 
 composite_weighted_score   operational HITL routing — HIGHER is better
 cross_entropy              confidence calibration vs truth — LOWER is better

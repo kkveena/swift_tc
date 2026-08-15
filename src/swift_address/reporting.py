@@ -277,8 +277,8 @@ def build_cross_entropy_summary(instances: pd.DataFrame) -> pd.DataFrame:
         )
 
     losses = pd.to_numeric(frame["cross_entropy"], errors="coerce").dropna()
-    town = _correctness(frame, "town_exists_ok")
-    country = _correctness(frame, "country_exists_ok")
+    town = _correctness(frame, "town_exists_ok", "town_grounded")
+    country = _correctness(frame, "country_exists_ok", "country_grounded")
 
     rows: list[dict[str, Any]] = [
         {"metric": "Non-empty instances", "value": total, "denominator": "instances"},
@@ -307,15 +307,23 @@ def build_cross_entropy_summary(instances: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _correctness(frame: pd.DataFrame, column: str) -> tuple[float | None, int]:
-    """(percent correct, grounded count) for one nullable label column."""
-    if column not in frame.columns:
+def _correctness(
+    frame: pd.DataFrame, column: str, grounded_column: str
+) -> tuple[float | None, int]:
+    """(percent correct, grounded count) for one correctness-label column.
+
+    ``town_exists_ok`` / ``country_exists_ok`` are plain booleans now (unknown
+    collapses to False), so the paired ``*_grounded`` flag — not nullability —
+    decides the denominator. A coverage gap is still excluded rather than
+    counted as incorrect.
+    """
+    if column not in frame.columns or grounded_column not in frame.columns:
         return None, 0
-    labels = frame[column].dropna()
-    if labels.empty:
+    grounded = frame.loc[frame[grounded_column].astype(bool), column]
+    if grounded.empty:
         return None, 0
-    correct = int(labels.astype(bool).sum())
-    return round(100.0 * correct / len(labels), 2), int(len(labels))
+    correct = int(grounded.astype(bool).sum())
+    return round(100.0 * correct / len(grounded), 2), int(len(grounded))
 
 
 def _stat(value: Any) -> float | None:

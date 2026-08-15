@@ -1,8 +1,11 @@
-"""Nullable ground-truth labels and binary cross-entropy.
+"""Ground-truth correctness labels and binary cross-entropy.
 
 The distinction under test throughout: ``predicted_*_exists`` is "explicitly
 present in the text"; ``*_exists_ok`` is "correct, when independent evidence
-exists". Unknown is a third state and must never collapse into False.
+exists". ``*_exists_ok`` is a plain boolean — unknown collapses to ``False`` —
+but ``*_basis`` / ``*_available`` still separate a genuine judgement from a
+collapsed unknown, which is what keeps cross-entropy and the reporting
+correctness rate from counting a coverage gap as a model error.
 """
 
 from __future__ import annotations
@@ -129,7 +132,7 @@ class TestTownGroundTruth:
         assert truth.town_exists_ok is False
         assert truth.town_basis == "explicit_claim_refuted_by_text"
 
-    def test_null_when_town_merely_inferred(self, iso_provider, town_country_provider):
+    def test_false_when_town_merely_inferred(self, iso_provider, town_country_provider):
         verified = verify(
             make_response(town="BOSTON", town_is_explicit=False),
             "PO BOX 1234 US", iso_provider, town_country_provider,
@@ -138,12 +141,12 @@ class TestTownGroundTruth:
             verified, town_country_provider=town_country_provider
         )
         assert verified.town_exists is False
-        assert truth.town_exists_ok is None
+        assert truth.town_exists_ok is False
 
-    def test_null_when_town_absent_from_reference(
+    def test_false_when_town_absent_from_reference(
         self, iso_provider, town_country_provider
     ):
-        """A coverage gap is unknown, never wrong."""
+        """A coverage gap collapses to False, but town_basis still says why."""
         verified = verify(
             make_response(town="NOWHERESVILLE", country_candidates=[],
                           country_is_explicit=False),
@@ -153,17 +156,17 @@ class TestTownGroundTruth:
             verified, town_country_provider=town_country_provider
         )
         assert verified.town_exists is True          # it IS in the text
-        assert truth.town_exists_ok is None          # but nothing corroborates it
+        assert truth.town_exists_ok is False         # but nothing corroborates it
         assert truth.town_basis == "town_absent_from_reference"
 
-    def test_null_without_any_reference(self, iso_provider):
+    def test_false_without_any_reference(self, iso_provider):
         verified = verify(make_response(), "1 LINCOLN STREET BOSTON MA 02111 US",
                           iso_provider, None)
         truth = evaluate_ground_truth(verified, town_country_provider=None)
-        assert truth.town_exists_ok is None
+        assert truth.town_exists_ok is False
         assert truth.town_basis == "no_town_country_reference"
 
-    def test_null_when_no_town_predicted(self, iso_provider, town_country_provider):
+    def test_false_when_no_town_predicted(self, iso_provider, town_country_provider):
         from swift_address.schemas import NO_TOWN
 
         verified = verify(
@@ -173,15 +176,15 @@ class TestTownGroundTruth:
         truth = evaluate_ground_truth(
             verified, town_country_provider=town_country_provider
         )
-        assert truth.town_exists_ok is None
+        assert truth.town_exists_ok is False
 
-    def test_null_on_extraction_error(self):
+    def test_false_on_extraction_error(self):
         from swift_address.scoring import error_result
 
         verified, _ = error_result("timeout")
         truth = evaluate_ground_truth(verified, extraction_failed=True)
-        assert truth.town_exists_ok is None
-        assert truth.country_exists_ok is None
+        assert truth.town_exists_ok is False
+        assert truth.country_exists_ok is False
         assert truth.town_basis == "extraction_error"
 
 
@@ -230,10 +233,10 @@ class TestCountryGroundTruth:
         assert truth.country_exists_ok is False
         assert truth.country_basis == "contradicted_by_reference"
 
-    def test_null_for_multi_country_town_without_resolution(
+    def test_false_for_multi_country_town_without_resolution(
         self, iso_provider, town_country_provider
     ):
-        """Unresolved is not incorrect — this must be None, never False."""
+        """Unresolved collapses to False, but country_basis still says why."""
         verified = verify(
             make_response(town="LIMA", country_candidates=["PE"],
                           country_is_explicit=False),
@@ -244,10 +247,10 @@ class TestCountryGroundTruth:
         truth = evaluate_ground_truth(
             verified, town_country_provider=town_country_provider
         )
-        assert truth.country_exists_ok is None
+        assert truth.country_exists_ok is False
         assert truth.country_basis == "reference_multi_country_unresolved"
 
-    def test_null_for_escalated_ambiguous_candidate_set(
+    def test_false_for_escalated_ambiguous_candidate_set(
         self, iso_provider, town_country_provider
     ):
         verified = verify(
@@ -261,9 +264,9 @@ class TestCountryGroundTruth:
         truth = evaluate_ground_truth(
             verified, town_country_provider=town_country_provider
         )
-        assert truth.country_exists_ok is None
+        assert truth.country_exists_ok is False
 
-    def test_null_when_town_not_found_in_reference(
+    def test_false_when_town_not_found_in_reference(
         self, iso_provider, town_country_provider
     ):
         verified = verify(
@@ -274,9 +277,9 @@ class TestCountryGroundTruth:
         truth = evaluate_ground_truth(
             verified, town_country_provider=town_country_provider
         )
-        assert truth.country_exists_ok is None
+        assert truth.country_exists_ok is False
 
-    def test_null_when_no_country_predicted(self, iso_provider, town_country_provider):
+    def test_false_when_no_country_predicted(self, iso_provider, town_country_provider):
         verified = verify(
             make_response(town="BOSTON", country_candidates=[],
                           country_is_explicit=False),
@@ -285,7 +288,7 @@ class TestCountryGroundTruth:
         truth = evaluate_ground_truth(
             verified, town_country_provider=town_country_provider
         )
-        assert truth.country_exists_ok is None
+        assert truth.country_exists_ok is False
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +437,8 @@ class TestGroupCrossEntropy:
         assert result.country_cross_entropy == pytest.approx(2.995732, abs=1e-6)
 
     def test_null_helpers_are_ungrounded(self):
-        assert null_ground_truth().town_exists_ok is None
+        assert null_ground_truth().town_exists_ok is False
+        assert null_ground_truth().town_available is False
         assert null_cross_entropy().group_cross_entropy is None
         assert null_cross_entropy().status == STATUS_NOT_AVAILABLE
 

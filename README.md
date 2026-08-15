@@ -81,20 +81,22 @@ evaluation metric stay honest.
 |---|---|---|
 | `predicted_town_exists_*` | is the predicted Town **explicitly present in the input text**? | boolean |
 | `predicted_country_exists_*` | is the predicted Country explicitly present in the input text? | boolean |
-| `town_exists_ok_*` | when independent evidence exists, **was the prediction correct**? | **nullable** boolean |
-| `country_exists_ok_*` | same, for Country | **nullable** boolean |
+| `town_exists_ok_*` | when independent evidence exists, **was the prediction correct**? | boolean |
+| `country_exists_ok_*` | same, for Country | boolean |
 
-The meaning of `predicted_*_exists` is unchanged. `*_exists_ok` has three states:
+The meaning of `predicted_*_exists` is unchanged. `*_exists_ok` is a plain boolean — it is never
+blank in the CSV or `null` in the JSON audit:
 
 ```text
 True   evidence is available and supports the prediction
-False  evidence is available and contradicts the prediction
-blank  evidence is insufficient, unavailable, unresolved, or ambiguous
+False  evidence contradicts the prediction, OR is insufficient, unavailable, unresolved, or ambiguous
 ```
 
-**"Not found in the reference" is blank, never False.** Unknown is not the same as incorrect, and
-collapsing the two would manufacture model errors out of reference-coverage gaps — and then feed
-them into the loss. Stored as pandas `BooleanDtype`; JSON `true` / `false` / `null`.
+**Unknown collapses into `False`.** The distinction between "contradicted" and "no evidence" still
+exists internally (see the audit trail's basis fields), and cross-entropy / correctness-rate
+reporting still exclude genuine coverage gaps from the loss rather than counting them as a model
+error — only the `*_exists_ok` columns themselves no longer surface a third blank state. Stored as
+plain `bool`; JSON `true` / `false`.
 
 The two can legitimately disagree. A Country the model inferred is `predicted_country_exists=False`
 (it genuinely is not in the text) while `country_exists_ok=True` (a single-country reference town
@@ -105,12 +107,13 @@ Ground-truth rules, conservative by design:
 * **Town `True`** needs the town explicitly present on token boundaries **and** known to the
   Town/Country reference. Neither alone suffices — looking the model's own answer up in a gazetteer
   would be circular ground truth.
-* **Town `False`** only on positive contradiction: the model asserted an explicit town that
-  token-boundary verification proves is absent (the `AERONAUTICA` → `RONA` case).
+* **Town `False`** on positive contradiction (the model asserted an explicit town that
+  token-boundary verification proves is absent — the `AERONAUTICA` → `RONA` case), or when there is
+  simply no independent evidence to judge the prediction against.
 * **Country `True`** when explicitly supported in the address, or when a reference-known town
   resolves to exactly one country and the prediction matches it.
-* **Country `False`** only when deterministic reference truth contradicts the prediction.
-* A multi-country town with no explicit resolution is **`null`**, never `False`.
+* **Country `False`** when deterministic reference truth contradicts the prediction, or when there is
+  no independent evidence — including an unresolved multi-country town.
 
 ### Two metrics, opposite directions
 

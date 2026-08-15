@@ -70,9 +70,7 @@ OUTPUT_FIELD_KEYS: tuple[str, ...] = (
 
 #: Output fields carrying a *nullable* boolean. "Unknown" is a distinct state
 #: from False: unavailable ground truth is not a wrong prediction.
-NULLABLE_BOOLEAN_FIELD_KEYS: frozenset[str] = frozenset(
-    {"town_exists_ok", "country_exists_ok"}
-)
+NULLABLE_BOOLEAN_FIELD_KEYS: frozenset[str] = frozenset()
 
 #: Output fields carrying a nullable float (blank when not computable).
 NULLABLE_FLOAT_FIELD_KEYS: frozenset[str] = frozenset({"cross_entropy"})

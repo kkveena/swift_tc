@@ -782,10 +782,10 @@ def _row_values(decision: Decision, retraction: RetractionResult) -> list[Any]:
     Length is derived from the field tuple, so adding an output field means
     editing `OUTPUT_FIELD_KEYS` and this list together and nothing else.
 
-    ``town_exists_ok`` / ``country_exists_ok`` stay ``None`` when unknown —
-    they are nullable, and collapsing unknown to False would invent model
-    errors. ``cross_entropy`` is likewise ``None`` when ungrounded, which the
-    CSV writes as a blank cell rather than a misleading zero.
+    ``town_exists_ok`` / ``country_exists_ok`` are plain booleans — unknown or
+    unresolved evidence collapses to ``False`` rather than a blank cell.
+    ``cross_entropy`` is likewise ``None`` when ungrounded, which the CSV
+    writes as a blank cell rather than a misleading zero.
     """
     verified = decision.verified
     return [
@@ -820,10 +820,15 @@ INSTANCE_COLUMNS: tuple[str, ...] = (
     "extraction_error",
     "reference_status",
     "needs_hitl",
-    # Evaluation columns. Nullable: an ungrounded instance is excluded from the
-    # loss rather than counted as a model failure.
+    # Evaluation columns. town_exists_ok / country_exists_ok are plain
+    # booleans (unknown collapses to False); the paired *_grounded flags say
+    # whether that came from real evidence, so cross-entropy and the
+    # correctness rate can still exclude coverage gaps from the loss rather
+    # than counting them as a model failure.
     "town_exists_ok",
+    "town_grounded",
     "country_exists_ok",
+    "country_grounded",
     "cross_entropy",
     "cross_entropy_status",
     # Raw confidences, kept for calibration diagnostics.
@@ -854,8 +859,10 @@ def _build_instance_frame(
                     "extraction_error": score_result.scenario == "extraction_error",
                     "reference_status": verified.reference_status,
                     "needs_hitl": bool(score_result.needs_hitl),
-                    "town_exists_ok": decision.ground_truth.town_exists_ok,
-                    "country_exists_ok": decision.ground_truth.country_exists_ok,
+                    "town_exists_ok": bool(decision.ground_truth.town_exists_ok),
+                    "town_grounded": bool(decision.ground_truth.town_available),
+                    "country_exists_ok": bool(decision.ground_truth.country_exists_ok),
+                    "country_grounded": bool(decision.ground_truth.country_available),
                     "cross_entropy": decision.cross_entropy.group_cross_entropy,
                     "cross_entropy_status": decision.cross_entropy.status,
                     "town_probability": float(verified.town_probability),
@@ -866,8 +873,10 @@ def _build_instance_frame(
         return pd.DataFrame(columns=list(INSTANCE_COLUMNS))
 
     frame = pd.DataFrame(records, columns=list(INSTANCE_COLUMNS))
-    frame["town_exists_ok"] = frame["town_exists_ok"].astype("boolean")
-    frame["country_exists_ok"] = frame["country_exists_ok"].astype("boolean")
+    frame["town_exists_ok"] = frame["town_exists_ok"].astype(bool)
+    frame["town_grounded"] = frame["town_grounded"].astype(bool)
+    frame["country_exists_ok"] = frame["country_exists_ok"].astype(bool)
+    frame["country_grounded"] = frame["country_grounded"].astype(bool)
     frame["cross_entropy"] = pd.to_numeric(frame["cross_entropy"], errors="coerce")
     return frame
 
@@ -906,7 +915,12 @@ def _coerce_output_dtypes(
         "predicted_country_probability",
         "composite_weighted_score",
     }
-    bool_keys = {"predicted_town_exists", "predicted_country_exists"}
+    bool_keys = {
+        "predicted_town_exists",
+        "predicted_country_exists",
+        "town_exists_ok",
+        "country_exists_ok",
+    }
 
     for group in group_config.enabled_groups:
         for key in OUTPUT_FIELD_KEYS:

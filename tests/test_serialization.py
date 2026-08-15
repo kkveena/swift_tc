@@ -144,12 +144,7 @@ class TestAgreementWithCsv:
             ):
                 csv_value = row[config.output.column_name(field_key, "15")]
                 json_value = group["ground_truth_validation"][json_key]
-                if json_value is None:
-                    assert csv_value is None or csv_value is not csv_value or (
-                        str(csv_value) in {"<NA>", "nan", ""}
-                    )
-                else:
-                    assert bool(csv_value) == json_value
+                assert bool(csv_value) == json_value
 
     def test_cross_entropy_matches_the_csv(self, documents, run_result, config):
         docs, _ = documents
@@ -238,12 +233,13 @@ class TestJsonValidity:
         ]
         assert ungrounded, "the sample should contain at least one ungrounded group"
 
-    def test_nullable_booleans_serialize_as_json_null(self, documents):
+    def test_ungrounded_booleans_serialize_as_false(self, documents):
         docs, _ = documents
         lima = next(doc for doc in docs if doc["record_id"] == "CA0000000694")
         validation = lima["groups"]["15"]["ground_truth_validation"]
         assert validation["town_exists_ok"] is True
-        assert validation["country_exists_ok"] is None      # not False
+        # Unresolved multi-country town: collapsed from "unknown" to False.
+        assert validation["country_exists_ok"] is False
 
     def test_every_line_is_independently_parseable(self, documents):
         _, path = documents

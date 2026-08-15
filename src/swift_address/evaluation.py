@@ -8,17 +8,21 @@ present in the input address text?"**. Their meaning is unchanged.
 
 ``town_exists_ok`` / ``country_exists_ok`` (produced here) answer a different
 question: **"when independent deterministic evidence is available, was the
-prediction correct?"** They are *nullable* booleans:
+prediction correct?"** They are plain booleans — ``<NA>`` never appears in a
+output column or report built from them:
 
 ===========  ===============================================================
 ``True``     evidence is available and supports the prediction
-``False``    evidence is available and contradicts the prediction
-``None``     evidence is insufficient, unavailable, unresolved, or ambiguous
+``False``    evidence contradicts the prediction, OR is insufficient,
+             unavailable, unresolved, or ambiguous
 ===========  ===============================================================
 
-"Not found in the reference" is ``None``, never ``False``. Unknown is not the
-same thing as incorrect, and collapsing the two would silently manufacture
-model errors out of reference-coverage gaps — and then feed them into the loss.
+"Not found in the reference" collapses to ``False`` here, same as a positive
+contradiction. The two are still told apart internally — see ``town_basis`` /
+``country_basis`` and the ``town_available`` / ``country_available``
+properties — so cross-entropy and the reporting correctness-rate keep
+excluding genuine coverage gaps from the loss rather than counting them as
+model errors.
 
 Cross-entropy scores how well the model's *confidence* matched those labels. It
 is an evaluation metric, not a routing metric:
@@ -78,22 +82,38 @@ STATUS_REFERENCE_NOT_FOUND = "reference_not_found"
 PARTIAL_STATUSES = frozenset({STATUS_TOWN_ONLY, STATUS_COUNTRY_ONLY})
 
 
+#: Bases under which town_exists_ok reflects a real, deterministic judgement
+#: rather than a collapsed "unknown". Drives cross-entropy / correctness-rate
+#: exclusion so a coverage gap is never counted as a model error.
+_GROUNDED_TOWN_BASES = frozenset(
+    {"explicit_claim_refuted_by_text", "explicit_in_text_and_known_to_reference"}
+)
+#: Same idea, for country_exists_ok.
+_GROUNDED_COUNTRY_BASES = frozenset(
+    {
+        "contradicted_by_reference",
+        "explicit_in_address_text",
+        "single_country_reference_match",
+    }
+)
+
+
 @dataclass(frozen=True)
 class GroundTruth:
-    """Nullable correctness labels plus why each one came out that way."""
+    """Correctness labels (plain booleans) plus why each one came out that way."""
 
-    town_exists_ok: bool | None = None
-    country_exists_ok: bool | None = None
+    town_exists_ok: bool = False
+    country_exists_ok: bool = False
     town_basis: str = "no_evidence"
     country_basis: str = "no_evidence"
 
     @property
     def town_available(self) -> bool:
-        return self.town_exists_ok is not None
+        return self.town_basis in _GROUNDED_TOWN_BASES
 
     @property
     def country_available(self) -> bool:
-        return self.country_exists_ok is not None
+        return self.country_basis in _GROUNDED_COUNTRY_BASES
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,23 +183,23 @@ def evaluate_ground_truth(
     town_country_provider: Any = None,
     extraction_failed: bool = False,
 ) -> GroundTruth:
-    """Derive nullable correctness labels from deterministic evidence only.
+    """Derive plain-boolean correctness labels from deterministic evidence only.
 
     **Town.** ``True`` needs two independent things to agree: the predicted town
     is explicitly present in the address on token boundaries (evidence that
     comes from the *input*, not from the model), and the normalized town exists
     in the configured Town/Country reference. Neither alone is enough — looking
     the model's own answer up in a gazetteer would be circular, and text
-    presence alone does not prove the span is a town. ``False`` requires
-    positive contradiction: the model asserted an explicit town that
-    token-boundary verification proves is not there. Everything else is
-    ``None``.
+    presence alone does not prove the span is a town. Everything else — a
+    positive contradiction (the model asserted an explicit town that
+    token-boundary verification proves is not there) as well as any case where
+    evidence is simply unavailable — is ``False``. Use ``town_basis`` /
+    ``town_available`` to tell those two apart when it matters.
 
     **Country.** ``True`` when the predicted code is explicitly supported in the
     address, or when a reference-known town resolves to exactly one country and
-    the prediction is that country. ``False`` when deterministic reference truth
-    exists and the prediction contradicts it. A town spanning several countries
-    with no explicit resolution is ``None`` — unresolved, not wrong.
+    the prediction is that country. Everything else, including deterministic
+    contradiction and unresolved multi-country towns, is ``False``.
     """
     if extraction_failed:
         return GroundTruth(
@@ -198,9 +218,9 @@ def evaluate_ground_truth(
 
 def _town_label(
     verified: VerifiedExtraction, provider: Any
-) -> tuple[bool | None, str]:
+) -> tuple[bool, str]:
     if verified.town in {"", NO_TOWN}:
-        return None, "no_town_predicted"
+        return False, "no_town_predicted"
 
     # Positive contradiction: the model claimed explicit support the text does
     # not carry. This is the AERONAUTICA -> RONA case.
@@ -209,26 +229,26 @@ def _town_label(
 
     if not verified.town_exists:
         # Inferred town. Nothing independent confirms or refutes it.
-        return None, "town_inferred_no_independent_truth"
+        return False, "town_inferred_no_independent_truth"
 
     if provider is None:
-        return None, "no_town_country_reference"
+        return False, "no_town_country_reference"
 
     if not provider.knows(verified.town):
         # Reference coverage gap. Not a model error.
-        return None, "town_absent_from_reference"
+        return False, "town_absent_from_reference"
 
     return True, "explicit_in_text_and_known_to_reference"
 
 
 def _country_label(
     verified: VerifiedExtraction, provider: Any
-) -> tuple[bool | None, str]:
+) -> tuple[bool, str]:
     if verified.country_value in {"", NO_COUNTRY} or not verified.country_candidates:
-        return None, "no_country_predicted"
+        return False, "no_country_predicted"
 
     if verified.country_ambiguous:
-        return None, "country_candidates_unresolved"
+        return False, "country_candidates_unresolved"
 
     predicted = verified.country_candidates[0]
 
@@ -242,12 +262,12 @@ def _country_label(
     reference_codes = verified.reference_codes
     if not reference_codes:
         if verified.reference_status in {REFERENCE_NOT_FOUND, REFERENCE_NOT_CHECKED}:
-            return None, (
+            return False, (
                 "reference_not_found"
                 if verified.reference_status == REFERENCE_NOT_FOUND
                 else "no_town_country_reference"
             )
-        return None, "no_reference_evidence"
+        return False, "no_reference_evidence"
 
     if verified.reference_status in {
         REFERENCE_MULTI_ANNOTATED,
@@ -255,7 +275,7 @@ def _country_label(
     } or len(reference_codes) > 1:
         # The town spans several countries and the address did not resolve it.
         # Unresolved is not incorrect.
-        return None, "reference_multi_country_unresolved"
+        return False, "reference_multi_country_unresolved"
 
     if predicted == reference_codes[0]:
         return True, "single_country_reference_match"
