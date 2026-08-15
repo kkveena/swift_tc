@@ -1,0 +1,72 @@
+project:
+  prompt_version: "v2-composite-weighted"
+  record_id_column: "RECORD_ID"
+
+input:
+  preserve_all_columns: true
+  zero_field_is_missing: true
+
+output:
+  naming_style: "canonical"
+  country_candidate_separator: ","
+  country_candidate_sort: "alphabetical"
+  templates:
+    combined_address: "combined_address_group_{id}"
+    combined_address_cleaned: "combined_address_cleaned_group_{id}"
+    predicted_town: "predicted_town_group_{id}"
+    predicted_country: "predicted_country_group_{id}"
+    predicted_town_probability: "predicted_town_probability_group_{id}"
+    predicted_country_probability: "predicted_country_probability_group_{id}"
+    predicted_town_exists: "predicted_town_exists_group_{id}"
+    predicted_country_exists: "predicted_country_exists_group_{id}"
+    composite_weighted_score: "composite_weighted_score_group_{id}"
+    rationale_town: "rationale_town_group_{id}"
+    rationale_country: "rationale_country_group_{id}"
+
+model:
+  model_env_var: "GEMINI_MODEL"
+  default_model: "gemini-3.5-flash"
+  temperature: 0.0
+  max_output_tokens: 700
+  concurrency: 4
+  max_retries: 5
+  request_timeout_seconds: 60
+  checkpoint_every_unique_addresses: 100
+
+processing:
+  deduplicate_addresses: true
+  cache_enabled: true
+  cache_path: "outputs/address_cache.jsonl"
+  errors_path: "outputs/processing_errors.csv"
+  metrics_path: "outputs/run_metrics.json"
+  redact_raw_address_in_logs: true
+
+reference_data:
+  provider: "null"
+  iso3166_path: "data/reference/iso3166.csv"
+  swiftref_enabled: false
+
+scoring:
+  mode: "composite_weighted"
+  hitl_threshold: 0.80
+  ambiguous_country_probability_override: 0.00
+  force_ambiguous_country_to_hitl: true
+  rules:
+    both_explicit:
+      town_weight: 1.00
+      country_weight: 1.00
+    country_explicit_town_inferred:
+      town_weight: 0.50
+      country_weight: 1.00
+    town_explicit_country_inferred:
+      town_weight: 0.75
+      country_weight: 0.50
+    town_explicit_country_ambiguous:
+      town_weight: 0.50
+      country_weight: 0.00
+    neither_explicit_both_inferred:
+      town_weight: 0.20
+      country_weight: 0.20
+    no_defensible_prediction:
+      town_weight: 0.00
+      country_weight: 0.00
