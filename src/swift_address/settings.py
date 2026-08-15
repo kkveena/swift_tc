@@ -68,8 +68,12 @@ OUTPUT_FIELD_KEYS: tuple[str, ...] = (
     "combined_address_retracted_comments",
 )
 
-#: Output fields carrying a *nullable* boolean. "Unknown" is a distinct state
-#: from False: unavailable ground truth is not a wrong prediction.
+#: Output fields to write as pandas ``BooleanDtype`` (True / False / <NA>).
+#:
+#: **Currently empty, deliberately.** `town_exists_ok` / `country_exists_ok` were
+#: nullable until unknown was collapsed into False; they are plain booleans now.
+#: The seam is kept so a future tri-state column only has to be named here — the
+#: dtype handling in `pipeline._coerce_output_dtypes` is already wired for it.
 NULLABLE_BOOLEAN_FIELD_KEYS: frozenset[str] = frozenset()
 
 #: Output fields carrying a nullable float (blank when not computable).

@@ -283,6 +283,11 @@ reference" collapses to `False` in this column; the distinction from a positive 
 lives in the audit trail's basis fields, and cross-entropy / correctness-rate reporting still exclude
 genuine coverage gaps from the loss rather than treating them as a wrong answer.
 
+The collapse is scoped to the two CSV columns. In the detailed-JSON audit payload an ungrounded
+component reports `null` for `*_correct`, `*_probability` and `*_cross_entropy` alike — so a
+null-skipped group and an extracted-but-ungrounded one, which mean the same thing, serialize the
+same way. Only `status` differs between them, and only to record *why* the component is ungrounded.
+
 Town `True` requires two independent things to agree — explicit token-boundary presence in the
 address *and* the town being known to the reference. Requiring only the second would be circular:
 looking the model's own answer up in a gazetteer proves nothing about whether it belongs to *this*
