@@ -13,8 +13,8 @@ This starter is intentionally notebook-first, but the implementation should plac
 
    > **Superseded — the arithmetic, not the principle.** Later iterations appended
    > `predicted_country_name`, then the ground-truth, cross-entropy and retraction fields,
-   > reaching **17** fields per group: 16 × 17 = **272 appended columns** and **322** total for a
-   > 50-column input. The requirement that the count be *calculated* rather than hard-coded still
+   > then the explicit HITL decision fields, reaching **20** fields per group:
+   > 16 × 20 = **320 appended columns** and **370** total for a 50-column input. The requirement that the count be *calculated* rather than hard-coded still
    > holds and is enforced by `OUTPUT_FIELD_KEYS`.
 4. The user-supplied field names contained likely spelling typos (`comined`, `countrty`, `rational`). The new implementation should use canonical spellings (`combined`, `country`, `rationale`) by default. A naming-template config should make legacy names possible if downstream compatibility requires them.
 
@@ -23,7 +23,7 @@ This starter is intentionally notebook-first, but the implementation should plac
 - Input: CSV.
 - Group configuration: CSV or YAML; the supplied sample uses CSV.
 - Output: CSV preserving every input column and appending the configured columns for each group
-  (17 today), plus a nested detailed JSONL for audit and evaluation depth.
+  (20 today), plus a nested detailed JSONL for audit and evaluation depth.
 - Notebooks: `notebooks/01_phase1_address_extraction_DRY_RUN.ipynb` and `..._ACTUAL_RUN.ipynb`.
 - Gemini model: configurable environment variable; default `gemini-3.5-flash`.
 - Credentials: environment variables only; never hard-code secrets in notebooks, source code, YAML, or committed files.
@@ -61,6 +61,9 @@ pre-existing column position shifts:
 15. `cross_entropy_group_15`
 16. `combined_address_retracted_group_15`
 17. `combined_address_retracted_group_comments_15`
+18. `HITL_flag_group_15`
+19. `HITL_state_group_15`
+20. `HITL_state_reason_group_15`
 
 `predicted_country_name_*` is **deterministic reference-derived output**, not a second model
 prediction: Python expands `predicted_country_*` through the ISO 3166-1 layer. The two columns stay
@@ -68,7 +71,7 @@ aligned element for element, so `CA,US` pairs with `Canada,United States`, a sin
 single name, and `NO_COUNTRY` yields `NO_COUNTRY`. The response schema has no country-name field for
 the model to fill in.
 
-**17 fields per group** → 16 groups append 272 columns, and a 50-column input becomes **322**
+**20 fields per group** → 16 groups append 320 columns, and a 50-column input becomes **370**
 columns. As before, this is calculated from `OUTPUT_FIELD_KEYS` and the enabled group count; nothing
 in the code hard-codes it.
 
@@ -309,6 +312,93 @@ The raw Gemini candidate-set confidence may be retained in cache/debug metadata,
 
 A suggested development default is `0.80`, but it is a placeholder only. Any unresolved multiple-country case is mandatory HITL regardless of threshold.
 
+### The explicit HITL decision fields
+
+Three fields per group make the routing decision visible in the CSV:
+
+| Field | Meaning | Type |
+|---|---|---|
+| `HITL_flag_group_<id>` | final decision — is human review required? | boolean |
+| `HITL_state_group_<id>` | primary routing outcome after precedence | closed enum |
+| `HITL_state_reason_group_<id>` | one deterministic sentence explaining it | string |
+
+All three are computed in Python from configured policy. **Gemini never chooses the state and never
+writes the reason** — the response schema has no HITL field for it to fill in.
+
+Vocabulary, kept distinct because these are four different things:
+
+```text
+Composite Weighted Score        the numeric routing score
+scoring.hitl_threshold          the configured operational cutoff (0.80)
+HITL_flag                       the final human-review decision
+HITL_state                      the primary routing outcome / reason category
+HITL_state_reason               the deterministic human-readable explanation
+forced_review                   did a non-score control override or independently require HITL?
+reporting.recommended_threshold an analytical recommendation only (0.90) — never the cutoff
+```
+
+#### The threshold is not the only rule
+
+Review is required when the score falls below the threshold **or** when a forced-review control
+applies:
+
+```text
+HITL required  =  score < threshold  OR  a forced-review condition exists
+```
+
+A case with a score comfortably above the threshold still goes to a human if deterministic reference
+data disagrees with the prediction. The number never outranks the control, and the prediction is
+never silently replaced — a human decides.
+
+#### State precedence
+
+Several conditions can hold at once. An ambiguous Country always scores `0.00`, so it is *also*
+below any threshold; the primary state names the root cause, not the symptom.
+
+| # | State | `forced_review` | Meaning |
+|---|---|---|---|
+| 1 | `HITL_PROCESSING_ERROR` | `True` | extraction failed after configured retries |
+| 2 | `HITL_MANUAL_OVERRIDE` | `True` | manual / business override (Phase 2 seam; never set in Phase 1) |
+| 3 | `HITL_AMBIGUOUS_COUNTRY` | `True` | several Country candidates remain unresolved |
+| 4 | `HITL_REFERENCE_CONFLICT` | `True` | prediction contradicts deterministic reference data |
+| 5 | `HITL_LOW_SCORE` | `False` | score below the configured threshold, nothing else wrong |
+| 6 | `AUTO_ACCEPT_CANDIDATE` | `False` | score meets the threshold and no control applies |
+
+Only the primary state reaches the CSV; every applicable reason is retained in the detailed JSON
+under `contributing_reasons`. Comparison against the threshold uses full precision — rounding happens
+only when composing the reason text, and never in a way that makes the sentence contradict itself.
+
+`forced_review` is what tells an auditor *why* a case is with a human: because the score fell short,
+or because a stronger control took over regardless of the score.
+
+> **`AUTO_ACCEPT_CANDIDATE` means eligible under the current Phase 1 routing policy.** It is not
+> regulatory approval or final downstream authorization.
+
+A **null-skipped group is blank** — `HITL_flag=False`, empty state, empty reason. It is deliberately
+not `AUTO_ACCEPT_CANDIDATE`: the model never saw it, so no judgement was made either way. The
+detailed JSON keeps `"status": "null_skip"` as the authoritative marker.
+
+`ScoreResult.needs_hitl` is unchanged and still present. `HitlDecision.required` agrees with it on
+every Phase 1 path; the documented exception is a manual override, which forces review by design.
+
+#### JSON block
+
+```json
+"hitl": {
+  "required": true,
+  "state": "HITL_REFERENCE_CONFLICT",
+  "reason": "Predicted Country conflicts with deterministic reference data; human review is required despite Composite Weighted Score 0.91 meeting configured threshold 0.80.",
+  "configured_threshold": 0.80,
+  "composite_weighted_score": 0.91,
+  "forced_review": true,
+  "contributing_reasons": ["reference_conflict"],
+  "manual_override": false
+}
+```
+
+`outputs/reports/hitl_state_distribution.csv` reports the state mix over **non-empty** address-group
+instances; null skips are excluded from the denominator.
+
 ### Provisional recommendation: 0.90
 
 `reporting.recommended_threshold` is **0.90** — a conservative Phase 1 starting point, and
@@ -452,7 +542,7 @@ result = run_phase1("data/sample_input.csv", config, group_config,
 ### Tests
 
 ```bash
-python -m pytest          # 438 tests
+python -m pytest          # 526 tests
 ```
 
 Tests never read the real Town/Country reference file. `tests/conftest.py` repoints
@@ -468,7 +558,7 @@ parent directories, so deleting the tree is safe.
 
 | Path | Contents | Raw addresses |
 |---|---|---|
-| `outputs/phase1_output.csv` | every input column unchanged + 17 columns per enabled group | **Yes** |
+| `outputs/phase1_output.csv` | every input column unchanged + 20 columns per enabled group | **Yes** |
 | `outputs/phase1_detailed_output.jsonl` | nested per-record detail (streamed JSON Lines) | **Yes** |
 | `outputs/address_cache.jsonl` | cached extractions + audit metadata | **Yes** |
 | `outputs/processing_errors.csv` | one row per failed unique address, referenced by SHA-256 | No |
@@ -478,6 +568,7 @@ parent directories, so deleting the tree is safe.
 | `outputs/reports/scenario_distribution.csv` | policy-scenario mix | No |
 | `outputs/reports/threshold_sensitivity.csv` | routing volume at each candidate threshold | No |
 | `outputs/reports/cross_entropy_summary.csv` | calibration over grounded observations only | No |
+| `outputs/reports/hitl_state_distribution.csv` | HITL routing-state mix over non-empty instances | No |
 | `outputs/charts/composite_score_histogram.png` | the score distribution as a chart | No |
 
 ### Town/Country reference data (external runtime dependency)
@@ -617,7 +708,7 @@ notebooks/01_phase1_address_extraction.ipynb
 src/swift_address/                     settings, io, grouping, cleaning, schemas, reference_data,
                                        gemini_client, scoring, evaluation, retraction, cache,
                                        pipeline, reporting, serialization
-tests/                                 438 tests covering the acceptance criteria
+tests/                                 526 tests covering the acceptance criteria
 tests/fixtures/                        tiny Town/Country fixture used instead of the real file
 outputs/                               generated; git-ignored except outputs/README.md
 ```

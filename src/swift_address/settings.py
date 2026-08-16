@@ -66,6 +66,11 @@ OUTPUT_FIELD_KEYS: tuple[str, ...] = (
     "cross_entropy",
     "combined_address_retracted",
     "combined_address_retracted_comments",
+    # --- explicit HITL routing decision ------------------------------------
+    # Appended, like every earlier addition, so no existing column position moves.
+    "hitl_flag",
+    "hitl_state",
+    "hitl_state_reason",
 )
 
 #: Output fields to write as pandas ``BooleanDtype`` (True / False / <NA>).
@@ -283,6 +288,7 @@ class ReportingConfig(_Base):
     threshold_sensitivity_filename: str = "threshold_sensitivity.csv"
     scenario_distribution_filename: str = "scenario_distribution.csv"
     cross_entropy_summary_filename: str = "cross_entropy_summary.csv"
+    hitl_state_distribution_filename: str = "hitl_state_distribution.csv"
     histogram_filename: str = "composite_score_histogram.png"
     #: Lower edges of the score bands. Each band is [edge, next_edge), and the
     #: final band is closed at 1.0 so a perfect score is never dropped.

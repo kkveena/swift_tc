@@ -165,6 +165,18 @@ def _null_group_document(group: Any) -> dict[str, Any]:
         },
         "cross_entropy": null_cross_entropy().to_dict(),
         "retraction": retraction.to_dict(),
+        # A null-skipped group was never evaluated, so it is neither auto-accepted
+        # nor routed for review. Blank state, not AUTO_ACCEPT_CANDIDATE.
+        "hitl": {
+            "required": False,
+            "state": "",
+            "reason": "",
+            "configured_threshold": None,
+            "composite_weighted_score": 0.0,
+            "forced_review": False,
+            "contributing_reasons": [],
+            "manual_override": False,
+        },
     }
 
 
@@ -242,8 +254,34 @@ def _group_document(
             "country": str(column("rationale_country") or ""),
         },
         "retraction": retraction.to_dict(),
+        "hitl": _hitl_block(decision, column),
     }
     return document
+
+
+def _hitl_block(decision: Any, column: Any) -> dict[str, Any]:
+    """The explicit routing decision, including every contributing reason.
+
+    The CSV carries only the *primary* state after precedence; this block keeps
+    the full reason set, so an audit can see that a case was both
+    reference-conflicted and below threshold even though only the stronger
+    control named the state.
+    """
+    hitl = getattr(decision, "hitl", None)
+    if hitl is None:
+        return {
+            "required": bool(_bool_or_none(column("hitl_flag"))),
+            "state": str(column("hitl_state") or ""),
+            "reason": str(column("hitl_state_reason") or ""),
+            "configured_threshold": None,
+            "composite_weighted_score": _float_or_none(
+                column("composite_weighted_score")
+            ),
+            "forced_review": False,
+            "contributing_reasons": [],
+            "manual_override": False,
+        }
+    return hitl.to_dict()
 
 
 def _scoring_block(score: Any, column: Any) -> dict[str, Any]:

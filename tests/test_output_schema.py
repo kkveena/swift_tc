@@ -36,28 +36,40 @@ def run_result(config, group_config, reference_provider, mock_client, sample_inp
 
 
 class TestColumnArithmetic:
-    def test_seventeen_fields_per_group(self, config):
-        """12 prior fields + ground-truth labels, cross-entropy, and retraction."""
-        assert len(OUTPUT_FIELD_KEYS) == 17
-        assert config.fields_per_group == 17
+    def test_twenty_fields_per_group(self, config):
+        """17 prior fields + the explicit HITL flag, state and reason."""
+        assert len(OUTPUT_FIELD_KEYS) == 20
+        assert config.fields_per_group == 20
 
     def test_new_fields_are_appended_not_interleaved(self, config):
         """Pre-existing column positions must not shift for flat-file consumers."""
-        assert list(OUTPUT_FIELD_KEYS[-5:]) == [
+        assert list(OUTPUT_FIELD_KEYS[-8:]) == [
             "town_exists_ok",
             "country_exists_ok",
             "cross_entropy",
             "combined_address_retracted",
             "combined_address_retracted_comments",
+            "hitl_flag",
+            "hitl_state",
+            "hitl_state_reason",
         ]
         names = config.group_column_names("15")
-        assert names[-5:] == (
+        assert names[-8:] == (
             "town_exists_ok_group_15",
             "country_exists_ok_group_15",
             "cross_entropy_group_15",
             "combined_address_retracted_group_15",
             "combined_address_retracted_group_comments_15",
+            "HITL_flag_group_15",
+            "HITL_state_group_15",
+            "HITL_state_reason_group_15",
         )
+
+    def test_hitl_fields_use_the_canonical_acronym(self, config):
+        """HITL = Human-in-the-Loop. No HILT_* transpositions."""
+        names = config.group_column_names("15")
+        assert "HITL_flag_group_15" in names
+        assert not any("HILT" in name for name in names)
 
     def test_country_name_sits_directly_after_country_code(self, config):
         keys = list(OUTPUT_FIELD_KEYS)
@@ -69,7 +81,7 @@ class TestColumnArithmetic:
             == names.index("predicted_country_group_15") + 1
         )
 
-    def test_sixteen_groups_append_exactly_272_columns(
+    def test_sixteen_groups_append_exactly_320_columns(
         self, config, group_config, run_result, sample_input_path
     ):
         from swift_address.io import read_input_csv
@@ -80,11 +92,11 @@ class TestColumnArithmetic:
 
         assert appended == expected
         assert len(group_config.enabled_groups) == 16
-        assert appended == 272       # 16 x 17
+        assert appended == 320       # 16 x 20
 
-    def test_fifty_column_input_becomes_322_columns(self, run_result):
+    def test_fifty_column_input_becomes_370_columns(self, run_result):
         assert run_result.metrics["shape"]["input_columns"] == 50
-        assert len(run_result.frame.columns) == 322      # 50 + 16 x 17
+        assert len(run_result.frame.columns) == 370      # 50 + 16 x 20
 
     def test_count_is_derived_not_hard_coded(self, config, group_config, run_result):
         shape = run_result.metrics["shape"]
@@ -96,7 +108,7 @@ class TestColumnArithmetic:
     def test_a_different_group_count_changes_the_arithmetic(
         self, config, reference_provider, mock_client, tmp_path
     ):
-        """Three groups append 3 x 17 columns. Nothing in the code assumes 16."""
+        """Three groups append 3 x 20 columns. Nothing in the code assumes 16."""
         from swift_address.grouping import load_group_config
 
         group_path = tmp_path / "groups.csv"
@@ -117,7 +129,7 @@ class TestColumnArithmetic:
             mode="dry_run",
         )
         result = pipeline.run(frame)
-        assert len(result.frame.columns) == 7 + 3 * config.fields_per_group == 58
+        assert len(result.frame.columns) == 7 + 3 * config.fields_per_group == 67
 
     def test_no_accidental_extra_columns(self, config, group_config, run_result, sample_input_path):
         from swift_address.io import read_input_csv

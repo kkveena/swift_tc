@@ -64,7 +64,16 @@ from .evaluation import (
     null_ground_truth,
 )
 from .retraction import RetractionResult, null_retraction, retract_group
-from .scoring import ScoreResult, VerifiedExtraction, error_result, evaluate, null_result
+from .scoring import (
+    HitlDecision,
+    ScoreResult,
+    VerifiedExtraction,
+    determine_hitl_decision,
+    error_result,
+    evaluate,
+    null_hitl_decision,
+    null_result,
+)
 from .settings import (
     NULLABLE_BOOLEAN_FIELD_KEYS,
     NULLABLE_FLOAT_FIELD_KEYS,
@@ -130,11 +139,18 @@ class Decision:
     score: ScoreResult
     ground_truth: GroundTruth
     cross_entropy: CrossEntropyResult
+    hitl: HitlDecision
 
     @classmethod
-    def null(cls) -> "Decision":
+    def null(cls, scoring_config: Any) -> "Decision":
         verified, score_result = null_result()
-        return cls(verified, score_result, null_ground_truth(), null_cross_entropy())
+        return cls(
+            verified,
+            score_result,
+            null_ground_truth(),
+            null_cross_entropy(),
+            null_hitl_decision(scoring_config),
+        )
 
 
 @dataclass
@@ -262,6 +278,7 @@ class Phase1Pipeline:
                 "score": decision.score.to_audit_dict(),
                 "ground_truth": decision.ground_truth.to_dict(),
                 "cross_entropy": decision.cross_entropy.to_dict(),
+                "hitl": decision.hitl.to_dict(),
             }
             for key, decision in decisions.items()
             if key in pass1.work_items
@@ -296,7 +313,8 @@ class Phase1Pipeline:
         # an empty retraction. Computed once and reused for every empty instance.
         null_values_by_group = {
             group.group_id: _row_values(
-                Decision.null(), null_retraction(group.source_fields)
+                Decision.null(self.config.scoring),
+                null_retraction(group.source_fields),
             )
             for group in self.group_config.enabled_groups
         }
@@ -520,6 +538,12 @@ class Phase1Pipeline:
                     score=score_result,
                     ground_truth=ground_truth,
                     cross_entropy=compute_cross_entropy(verified, ground_truth),
+                    hitl=determine_hitl_decision(
+                        verified,
+                        score_result,
+                        self.config.scoring,
+                        extraction_error=True,
+                    ),
                 )
                 continue
 
@@ -546,6 +570,11 @@ class Phase1Pipeline:
                 score=score_result,
                 ground_truth=ground_truth,
                 cross_entropy=compute_cross_entropy(verified, ground_truth),
+                # Phase 1 never sets manual_override; the seam is there for the
+                # Phase 2 HITL workflow to drive.
+                hitl=determine_hitl_decision(
+                    verified, score_result, self.config.scoring
+                ),
             )
         return decisions
 
@@ -672,6 +701,8 @@ class Phase1Pipeline:
         scenarios: Counter[str] = Counter()
         reference_statuses: Counter[str] = Counter()
         cross_entropy_statuses: Counter[str] = Counter()
+        hitl_states: Counter[str] = Counter()
+        forced_review_instances = 0
         hitl_instances = 0
         ambiguous_instances = 0
         ambiguous_addresses = 0
@@ -683,6 +714,9 @@ class Phase1Pipeline:
             verified, score_result = decision.verified, decision.score
             occurrences = len(item.occurrences)
             cross_entropy_statuses[decision.cross_entropy.status] += occurrences
+            hitl_states[decision.hitl.state] += occurrences
+            if decision.hitl.forced_review:
+                forced_review_instances += occurrences
             if decision.ground_truth.town_available:
                 town_grounded += occurrences
             if decision.ground_truth.country_available:
@@ -772,6 +806,10 @@ class Phase1Pipeline:
                 "force_ambiguous_to_hitl": (
                     self.config.scoring.force_ambiguous_country_to_hitl
                 ),
+                # Primary routing state after precedence, per instance. Null
+                # skips are counted separately and are not a HITL state.
+                "state_counts": dict(sorted(hitl_states.items())),
+                "forced_review_instances": forced_review_instances,
             },
         }
 
@@ -806,6 +844,9 @@ def _row_values(decision: Decision, retraction: RetractionResult) -> list[Any]:
         _round_or_none(decision.cross_entropy.group_cross_entropy),
         retraction.combined_address_retracted,
         retraction.comment,
+        bool(decision.hitl.required),
+        decision.hitl.state,
+        decision.hitl.reason,
     ]
 
 
@@ -834,6 +875,11 @@ INSTANCE_COLUMNS: tuple[str, ...] = (
     # Raw confidences, kept for calibration diagnostics.
     "town_probability",
     "country_probability",
+    # Explicit HITL routing decision. `hitl_state` is the primary state after
+    # precedence; `hitl_forced_review` says whether a control overrode the score.
+    "hitl_flag",
+    "hitl_state",
+    "hitl_forced_review",
 )
 
 
@@ -867,6 +913,9 @@ def _build_instance_frame(
                     "cross_entropy_status": decision.cross_entropy.status,
                     "town_probability": float(verified.town_probability),
                     "country_probability": float(verified.country_probability),
+                    "hitl_flag": bool(decision.hitl.required),
+                    "hitl_state": decision.hitl.state,
+                    "hitl_forced_review": bool(decision.hitl.forced_review),
                 }
             )
     if not records:
@@ -920,6 +969,7 @@ def _coerce_output_dtypes(
         "predicted_country_exists",
         "town_exists_ok",
         "country_exists_ok",
+        "hitl_flag",
     }
 
     for group in group_config.enabled_groups:

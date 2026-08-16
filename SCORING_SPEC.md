@@ -104,6 +104,38 @@ The notebooks render this reasoning in a dedicated "Human-in-the-Loop Threshold 
 section, showing the configured operational threshold and the recommended analytical threshold
 *separately* — the recommendation never silently overwrites `scoring.hitl_threshold`.
 
+## HITL decision fields
+
+The Composite Weighted Score is the numeric routing *score*; it is not by itself the routing
+*decision*. Three group-level fields make the decision explicit:
+
+```text
+HITL_flag          final human-review decision (boolean)
+HITL_state         primary routing outcome after precedence (closed enum)
+HITL_state_reason  one deterministic sentence explaining it
+```
+
+Review is required when `composite < scoring.hitl_threshold` **or** when a forced-review control
+applies. Precedence, strongest first:
+
+| # | State | `forced_review` |
+|---|---|---|
+| 1 | `HITL_PROCESSING_ERROR` | `True` |
+| 2 | `HITL_MANUAL_OVERRIDE` | `True` |
+| 3 | `HITL_AMBIGUOUS_COUNTRY` | `True` |
+| 4 | `HITL_REFERENCE_CONFLICT` | `True` |
+| 5 | `HITL_LOW_SCORE` | `False` |
+| 6 | `AUTO_ACCEPT_CANDIDATE` | `False` |
+
+A reference conflict at score `0.91` against threshold `0.80` is `HITL_REFERENCE_CONFLICT` with
+`HITL_flag=True`: the control overrides the number. A null-skipped group is blank, never
+`AUTO_ACCEPT_CANDIDATE`. `ScoreResult.needs_hitl` is unchanged and agrees with `HitlDecision.required`
+on every Phase 1 path.
+
+`scoring.hitl_threshold` (0.80) is the operational cutoff used for routing.
+`reporting.recommended_threshold` (0.90) is an analytical recommendation shown in reporting and the
+notebooks — it never becomes the cutoff.
+
 ## Cross-entropy (evaluation, not routing)
 
 `cross_entropy_group_<id>` is binary log loss of model confidence against the nullable ground-truth

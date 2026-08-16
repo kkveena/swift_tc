@@ -29,7 +29,22 @@ from .schemas import NO_COUNTRY, NO_TOWN, ExtractionResponse
 
 __all__ = [
     "AMBIGUOUS_TOWN_INFERRED_SCENARIO",
+    "FORCED_REVIEW_STATES",
+    "HITL_AMBIGUOUS_COUNTRY",
+    "HITL_AUTO_ACCEPT_CANDIDATE",
+    "HITL_LOW_SCORE",
+    "HITL_MANUAL_OVERRIDE",
+    "HITL_PROCESSING_ERROR",
+    "HITL_REFERENCE_CONFLICT",
+    "HITL_STATE_NOT_EVALUATED",
+    "HITL_STATE_PRECEDENCE",
+    "HitlDecision",
     "NULL_SKIP_SCENARIO",
+    "REASON_BELOW_THRESHOLD",
+    "REASON_COUNTRY_AMBIGUOUS",
+    "REASON_MANUAL_OVERRIDE",
+    "REASON_PROCESSING_ERROR",
+    "REASON_REFERENCE_CONFLICT",
     "REFERENCE_CONFLICT",
     "REFERENCE_CONSISTENT",
     "REFERENCE_MULTI_ANNOTATED",
@@ -41,8 +56,10 @@ __all__ = [
     "REQUIRED_SCENARIOS",
     "ScoreResult",
     "VerifiedExtraction",
+    "determine_hitl_decision",
     "error_result",
     "evaluate",
+    "null_hitl_decision",
     "null_result",
     "score",
     "select_scenario",
@@ -530,6 +547,238 @@ def error_result(reason: str) -> tuple[VerifiedExtraction, ScoreResult]:
         needs_hitl=True,
     )
     return verified, result
+
+
+# ---------------------------------------------------------------------------
+# HITL routing decision
+# ---------------------------------------------------------------------------
+
+#: The only values `HITL_state_group_<id>` may take. Gemini never chooses one:
+#: this is deterministic Python policy end to end.
+HITL_AUTO_ACCEPT_CANDIDATE = "AUTO_ACCEPT_CANDIDATE"
+HITL_LOW_SCORE = "HITL_LOW_SCORE"
+HITL_AMBIGUOUS_COUNTRY = "HITL_AMBIGUOUS_COUNTRY"
+HITL_REFERENCE_CONFLICT = "HITL_REFERENCE_CONFLICT"
+HITL_PROCESSING_ERROR = "HITL_PROCESSING_ERROR"
+HITL_MANUAL_OVERRIDE = "HITL_MANUAL_OVERRIDE"
+
+#: Precedence, strongest control first. Several conditions can hold at once —
+#: an ambiguous country always scores 0.0 and is therefore *also* below any
+#: sane threshold — so the primary state names the root cause rather than the
+#: symptom. Every applicable reason still travels in `contributing_reasons`.
+HITL_STATE_PRECEDENCE: tuple[str, ...] = (
+    HITL_PROCESSING_ERROR,
+    HITL_MANUAL_OVERRIDE,
+    HITL_AMBIGUOUS_COUNTRY,
+    HITL_REFERENCE_CONFLICT,
+    HITL_LOW_SCORE,
+    HITL_AUTO_ACCEPT_CANDIDATE,
+)
+
+#: States reached because a control overrode (or independently required) review,
+#: rather than because the score fell short. Makes it auditable *why* a case is
+#: with a human.
+FORCED_REVIEW_STATES: frozenset[str] = frozenset(
+    {
+        HITL_PROCESSING_ERROR,
+        HITL_MANUAL_OVERRIDE,
+        HITL_AMBIGUOUS_COUNTRY,
+        HITL_REFERENCE_CONFLICT,
+    }
+)
+
+#: Machine-readable contributing-reason tokens, in precedence order.
+REASON_PROCESSING_ERROR = "processing_error"
+REASON_MANUAL_OVERRIDE = "manual_override"
+REASON_COUNTRY_AMBIGUOUS = "country_ambiguous"
+REASON_REFERENCE_CONFLICT = "reference_conflict"
+REASON_BELOW_THRESHOLD = "below_threshold"
+
+#: The null-skip state: a group short-circuited before any model call was never
+#: evaluated, so it is neither auto-accepted nor routed for review. Blank, not
+#: `AUTO_ACCEPT_CANDIDATE` — calling it a candidate would imply a judgement that
+#: was never made.
+HITL_STATE_NOT_EVALUATED = ""
+
+
+@dataclass(frozen=True)
+class HitlDecision:
+    """The final, deterministic human-review decision for one group instance."""
+
+    required: bool
+    state: str
+    reason: str
+    threshold: float
+    composite_weighted_score: float
+    forced_review: bool
+    contributing_reasons: tuple[str, ...] = ()
+    manual_override: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "required": self.required,
+            "state": self.state,
+            "reason": self.reason,
+            "configured_threshold": self.threshold,
+            "composite_weighted_score": self.composite_weighted_score,
+            "forced_review": self.forced_review,
+            "contributing_reasons": list(self.contributing_reasons),
+            "manual_override": self.manual_override,
+        }
+
+
+def determine_hitl_decision(
+    verified: VerifiedExtraction,
+    score_result: ScoreResult,
+    scoring_config: Any,
+    *,
+    extraction_error: bool = False,
+    manual_override: bool = False,
+    manual_override_reason: str = "",
+) -> HitlDecision:
+    """Decide whether a group instance needs a human, and say why.
+
+    The threshold is **not** the only rule. Review is required when the
+    composite score falls below ``scoring.hitl_threshold`` *or* when any
+    forced-review control applies. A case with a score comfortably above the
+    threshold still goes to a human if deterministic reference data disagrees
+    with the prediction — the number never overrules the control.
+
+    Precedence is :data:`HITL_STATE_PRECEDENCE`. Comparison against the
+    threshold uses full precision; rounding happens only when composing the
+    human-readable reason.
+
+    No model call. Gemini chooses neither the state nor the wording.
+    """
+    threshold = float(scoring_config.hitl_threshold)
+    composite = float(score_result.composite_weighted_score)
+    below_threshold = composite < threshold
+
+    ambiguous = bool(verified.country_ambiguous) and bool(
+        getattr(scoring_config, "force_ambiguous_country_to_hitl", True)
+    )
+    conflict = bool(verified.reference_conflict)
+
+    # Every applicable reason, in precedence order, regardless of which one
+    # becomes the primary state.
+    reasons: list[str] = []
+    if extraction_error:
+        reasons.append(REASON_PROCESSING_ERROR)
+    if manual_override:
+        reasons.append(REASON_MANUAL_OVERRIDE)
+    if ambiguous:
+        reasons.append(REASON_COUNTRY_AMBIGUOUS)
+    if conflict:
+        reasons.append(REASON_REFERENCE_CONFLICT)
+    if below_threshold:
+        reasons.append(REASON_BELOW_THRESHOLD)
+
+    if extraction_error:
+        state = HITL_PROCESSING_ERROR
+    elif manual_override:
+        state = HITL_MANUAL_OVERRIDE
+    elif ambiguous:
+        state = HITL_AMBIGUOUS_COUNTRY
+    elif conflict:
+        state = HITL_REFERENCE_CONFLICT
+    elif below_threshold:
+        state = HITL_LOW_SCORE
+    else:
+        state = HITL_AUTO_ACCEPT_CANDIDATE
+
+    return HitlDecision(
+        required=state != HITL_AUTO_ACCEPT_CANDIDATE,
+        state=state,
+        reason=_hitl_reason(
+            state, composite, threshold, below_threshold, manual_override_reason
+        ),
+        threshold=threshold,
+        composite_weighted_score=composite,
+        forced_review=state in FORCED_REVIEW_STATES,
+        contributing_reasons=tuple(reasons),
+        manual_override=bool(manual_override),
+    )
+
+
+def null_hitl_decision(scoring_config: Any) -> HitlDecision:
+    """The decision for a null-skipped group: no judgement was ever made.
+
+    Blank state and reason, `required=False`. Deliberately *not*
+    `AUTO_ACCEPT_CANDIDATE` — the model never saw this group, so calling it a
+    candidate would assert a conclusion nobody reached.
+    """
+    return HitlDecision(
+        required=False,
+        state=HITL_STATE_NOT_EVALUATED,
+        reason="",
+        threshold=float(scoring_config.hitl_threshold),
+        composite_weighted_score=0.0,
+        forced_review=False,
+        contributing_reasons=(),
+        manual_override=False,
+    )
+
+
+def _hitl_reason(
+    state: str,
+    composite: float,
+    threshold: float,
+    below_threshold: bool,
+    manual_override_reason: str,
+) -> str:
+    """One short deterministic sentence. Never model-written."""
+    score_text = _format_score(composite)
+    threshold_text = _format_score(threshold)
+
+    if state == HITL_PROCESSING_ERROR:
+        return (
+            "Extraction failed after configured retries; no valid model result "
+            "was produced."
+        )
+    if state == HITL_MANUAL_OVERRIDE:
+        return manual_override_reason or (
+            "Manual business override requires human review."
+        )
+    if state == HITL_AMBIGUOUS_COUNTRY:
+        return (
+            "Multiple Country candidates remain unresolved; mandatory human "
+            "review is required."
+        )
+    if state == HITL_REFERENCE_CONFLICT:
+        if below_threshold:
+            return (
+                "Predicted Country conflicts with deterministic reference data; "
+                "human review is required."
+            )
+        # Worth spelling out: the score passed and the control still won.
+        return (
+            "Predicted Country conflicts with deterministic reference data; human "
+            f"review is required despite Composite Weighted Score {score_text} "
+            f"meeting configured threshold {threshold_text}."
+        )
+    if state == HITL_LOW_SCORE:
+        return (
+            f"Composite Weighted Score {score_text} is below configured HITL "
+            f"threshold {threshold_text}."
+        )
+    return (
+        f"Composite Weighted Score {score_text} meets configured HITL threshold "
+        f"{threshold_text} and no forced-review condition is present."
+    )
+
+
+def _format_score(value: float) -> str:
+    """Render a score for display at 4 decimals, trimmed to at least 2.
+
+    ``0.80`` reads as "0.80" rather than "0.8", while ``0.7999`` keeps its
+    precision instead of rounding to "0.80" and making the sentence
+    "0.80 is below configured HITL threshold 0.80" look self-contradictory.
+    """
+    text = f"{float(value):.4f}"
+    whole, _, fraction = text.partition(".")
+    fraction = fraction.rstrip("0")
+    fraction = fraction.ljust(2, "0")
+    return f"{whole}.{fraction}"
 
 
 def _country_present(
