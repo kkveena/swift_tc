@@ -32,6 +32,11 @@ output:
     # Deterministic retraction of verified Town/Country evidence.
     combined_address_retracted: "combined_address_retracted_group_{id}"
     combined_address_retracted_comments: "combined_address_retracted_group_comments_{id}"
+    # Explicit HITL routing decision. HITL = Human-in-the-Loop. Deterministic
+    # Python policy: Gemini never chooses the state or writes the reason.
+    hitl_flag: "HITL_flag_group_{id}"
+    hitl_state: "HITL_state_group_{id}"
+    hitl_state_reason: "HITL_state_reason_group_{id}"
   # Legacy aliases reproducing the original screenshot spellings. Selected by
   # naming_style: "legacy". Exactly one naming set is ever emitted.
   legacy_templates:
@@ -52,6 +57,9 @@ output:
     cross_entropy: "cross_entropy_group_{id}"
     combined_address_retracted: "comined_address_retracted_group_{id}"
     combined_address_retracted_comments: "comined_address_retracted_group_comments_{id}"
+    hitl_flag: "HITL_flag_group_{id}"
+    hitl_state: "HITL_state_group_{id}"
+    hitl_state_reason: "HITL_state_reason_group_{id}"
 
 model:
   model_env_var: "GEMINI_MODEL"

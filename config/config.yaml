@@ -53,6 +53,11 @@ output:
     # verified in the source text. Never a second model call.
     combined_address_retracted: "combined_address_retracted_group_{id}"
     combined_address_retracted_comments: "combined_address_retracted_group_comments_{id}"
+    # Explicit HITL routing decision. HITL = Human-in-the-Loop. Deterministic
+    # Python policy: Gemini never chooses the state or writes the reason.
+    hitl_flag: "HITL_flag_group_{id}"
+    hitl_state: "HITL_state_group_{id}"
+    hitl_state_reason: "HITL_state_reason_group_{id}"
   # [EXTENSION] Legacy aliases reproduce the original (typo'd) field names from
   # the source screenshots. Selected by naming_style: "legacy". Exactly one
   # naming set is ever emitted — the two sets are never produced together.
@@ -74,6 +79,9 @@ output:
     cross_entropy: "cross_entropy_group_{id}"
     combined_address_retracted: "comined_address_retracted_group_{id}"
     combined_address_retracted_comments: "comined_address_retracted_group_comments_{id}"
+    hitl_flag: "HITL_flag_group_{id}"
+    hitl_state: "HITL_state_group_{id}"
+    hitl_state_reason: "HITL_state_reason_group_{id}"
 
 model:
   model_env_var: "GEMINI_MODEL"
@@ -178,6 +186,8 @@ reporting:
   # Calibration summary over grounded observations only. LOWER is better —
   # the opposite direction to composite_weighted_score.
   cross_entropy_summary_filename: "cross_entropy_summary.csv"
+  # Distribution of the primary HITL routing state over non-empty instances.
+  hitl_state_distribution_filename: "hitl_state_distribution.csv"
   histogram_filename: "composite_score_histogram.png"
   # Lower edges of the score bands. Each band is [edge, next_edge); the last is
   # closed at 1.0. Scores below the first edge fall into the "< 0.60" band.

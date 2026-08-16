@@ -18,7 +18,7 @@ Pass 1: Address Group Builder
   - ignore null/blank/field == "0"
   - concatenate in configured order
   - deterministic cleaning
-  - initialize all configured output columns/group (12 today)
+  - initialize all configured output columns/group (20 today)
         |
         +------------------------------+
         | combined address empty?      |
@@ -141,10 +141,11 @@ For `G` groups and `K` group-output fields (`K = len(OUTPUT_FIELD_KEYS)`):
 
 `final_column_count = input_column_count + G * K`
 
-`K` is **17** — the original 11, plus `predicted_country_name`, plus the five ground-truth /
-evaluation / retraction fields — so for 50 input columns and 16 groups: `50 + 16*17 = 322`. The count
-is always derived from the field tuple and the enabled group count; no module hard-codes it. The five
-newest fields are *appended* rather than interleaved, so no pre-existing column position moved.
+`K` is **20** — the original 11, plus `predicted_country_name`, the five ground-truth /
+evaluation / retraction fields, and the three explicit HITL decision fields — so for 50 input
+columns and 16 groups: `50 + 16*20 = 370`. The count
+is always derived from the field tuple and the enabled group count; no module hard-codes it. Every
+addition has been *appended* rather than interleaved, so no pre-existing column position has moved.
 
 ## 6. Pass 1 — deterministic preprocessing
 
@@ -271,6 +272,7 @@ verify_extraction        -> predicted_*_exists   (explicit presence in the input
 evaluate_ground_truth    -> *_exists_ok          (correctness label, unknown collapses to False)
 compute_cross_entropy    -> cross_entropy        (log loss of confidence vs label)
 retract_group            -> combined_address_retracted (+ per-column before/after)
+determine_hitl_decision  -> HITL_flag / HITL_state / HITL_state_reason
 ```
 
 ### Two field families, two questions
@@ -314,10 +316,40 @@ The ambiguous-alpha2 trailing-position rule is evaluated against the **combined*
 individual field: a token in the middle of an address can sit inside the trailing window of its own
 short field, which would otherwise strip the preposition out of "SUITE 5 IN TOWER".
 
+### The HITL routing decision
+
+`HitlDecision` sits with the rest of the business policy in `scoring.py`, not scattered through the
+pipeline. It is pure Python: no model call chooses the state or writes the reason.
+
+The rule is **not** `composite < threshold`. Review is required when the score falls below
+`scoring.hitl_threshold` *or* when a forced-review control applies — processing failure, manual
+override, unresolved Country ambiguity, or a deterministic reference conflict. A score above the
+threshold does not release a case whose reference evidence disagrees with the prediction.
+
+Because several conditions can hold at once (an ambiguous Country always scores `0.00`, so it is
+*also* below threshold), a fixed precedence picks the primary state:
+
+```text
+HITL_PROCESSING_ERROR  >  HITL_MANUAL_OVERRIDE  >  HITL_AMBIGUOUS_COUNTRY
+                       >  HITL_REFERENCE_CONFLICT  >  HITL_LOW_SCORE
+                       >  AUTO_ACCEPT_CANDIDATE
+```
+
+Only the primary state reaches the CSV; `contributing_reasons` in the detailed JSON keeps the full
+set, so an audit can see a case was both conflicted *and* below threshold. `forced_review`
+distinguishes "the score fell short" from "a stronger control took over".
+
+`ScoreResult.needs_hitl` is retained unchanged; `HitlDecision` extends it with state, reason,
+forced_review, contributing reasons and the manual-override seam. The two agree on every Phase 1
+path — a manual override is the documented, intentional exception, and Phase 1 never sets one.
+
+A null-skipped group gets a blank state rather than `AUTO_ACCEPT_CANDIDATE`: it was never evaluated,
+so asserting it is a candidate would claim a judgement nobody made.
+
 ## 9b. Output surfaces
 
 ```text
-phase1_output.csv              flat compatibility artifact (17 fields/group)
+phase1_output.csv              flat compatibility artifact (20 fields/group)
 phase1_detailed_output.jsonl   nested per-record audit + evaluation depth (streamed)
 run_metrics.json               run-wide shape, savings, provenance, status counts
 reports/*.csv, charts/*.png    executive reporting

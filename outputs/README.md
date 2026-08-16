@@ -39,6 +39,7 @@ so those are the ones safe to circulate.
 | `reports/scenario_distribution.csv` | `reporting.write_reports` | No |
 | `reports/threshold_sensitivity.csv` | `reporting.write_reports` | No |
 | `reports/cross_entropy_summary.csv` | `reporting.write_reports` | No |
+| `reports/hitl_state_distribution.csv` | `reporting.write_reports` | No |
 | `charts/composite_score_histogram.png` | `reporting.render_score_histogram` | No |
 
 ## Paths are configuration

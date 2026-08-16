@@ -39,6 +39,7 @@ __all__ = [
     "band_labels",
     "build_cross_entropy_summary",
     "build_executive_summary",
+    "build_hitl_state_distribution",
     "build_kpi_table",
     "build_scenario_distribution",
     "build_score_distribution",
@@ -336,6 +337,49 @@ def _stat(value: Any) -> float | None:
     return None if pd.isna(numeric) else round(numeric, 6)
 
 
+def build_hitl_state_distribution(instances: pd.DataFrame) -> pd.DataFrame:
+    """Primary HITL routing state over non-empty address-group instances.
+
+    Every state appears even at zero count, so the table shape is stable across
+    runs and safe to diff. Null-skipped groups are excluded from the
+    denominator: they were never evaluated, so they are not a routing outcome.
+
+    The state is the *primary* one after precedence — a case that is both
+    reference-conflicted and below threshold is counted once, under
+    ``HITL_REFERENCE_CONFLICT``. All contributing reasons stay in the detailed
+    JSON.
+    """
+    from .scoring import HITL_STATE_PRECEDENCE
+
+    frame = _non_empty(instances)
+    total = len(frame)
+
+    # Report in precedence order rather than by frequency: this table is read as
+    # a control hierarchy, not a leaderboard.
+    ordered_states = list(HITL_STATE_PRECEDENCE)
+    counts = {state: 0 for state in ordered_states}
+
+    if total and "hitl_state" in frame.columns:
+        for state, count in frame["hitl_state"].value_counts().items():
+            key = str(state)
+            counts[key] = counts.get(key, 0) + int(count)
+            if key not in ordered_states:
+                # An unexpected state would otherwise vanish from the report.
+                ordered_states.append(key)
+
+    rows = [
+        {
+            "HITL_state": state,
+            "observation_count": counts.get(state, 0),
+            "percent_of_non_empty": _percent(counts.get(state, 0), total),
+        }
+        for state in ordered_states
+    ]
+    return pd.DataFrame(
+        rows, columns=["HITL_state", "observation_count", "percent_of_non_empty"]
+    )
+
+
 def build_kpi_table(
     metrics: Mapping[str, Any],
     instances: pd.DataFrame,
@@ -561,6 +605,7 @@ class ExecutiveReport:
     scenario_distribution: pd.DataFrame
     threshold_sensitivity: pd.DataFrame
     cross_entropy_summary: pd.DataFrame
+    hitl_state_distribution: pd.DataFrame
     executive_summary: dict[str, Any]
     paths: dict[str, Path]
 
@@ -590,6 +635,7 @@ def write_reports(
         instances, reporting.sensitivity_thresholds
     )
     cross_entropy = build_cross_entropy_summary(instances)
+    hitl_states = build_hitl_state_distribution(instances)
     summary = build_executive_summary(metrics, instances, threshold=effective_threshold)
 
     reports_dir = config.path(reporting.reports_dir)
@@ -608,6 +654,9 @@ def write_reports(
     )
     paths["cross_entropy_summary"] = _write_csv(
         cross_entropy, reports_dir / reporting.cross_entropy_summary_filename
+    )
+    paths["hitl_state_distribution"] = _write_csv(
+        hitl_states, reports_dir / reporting.hitl_state_distribution_filename
     )
 
     summary_path = reports_dir / reporting.executive_summary_filename
@@ -632,6 +681,7 @@ def write_reports(
         scenario_distribution=scenarios,
         threshold_sensitivity=sensitivity,
         cross_entropy_summary=cross_entropy,
+        hitl_state_distribution=hitl_states,
         executive_summary=summary,
         paths=paths,
     )
