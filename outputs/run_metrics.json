@@ -1,0 +1,104 @@
+{
+  "efficiency": {
+    "backend_calls": 0,
+    "cache_entries_loaded": 32,
+    "cache_hits": 7,
+    "cache_misses": 0,
+    "calls_avoided_by_dedupe": 0,
+    "calls_avoided_by_null_skip": 121,
+    "token_usage": {},
+    "unique_addresses": 7
+  },
+  "evaluation": {
+    "country_ground_truth_instances": 5,
+    "cross_entropy_status_counts": {
+      "both_grounded": 4,
+      "country_only": 1,
+      "not_available": 1,
+      "town_only": 1
+    },
+    "non_empty_instances": 7,
+    "town_ground_truth_instances": 5
+  },
+  "hitl": {
+    "force_ambiguous_to_hitl": true,
+    "forced_review_instances": 0,
+    "instances_below_threshold": 3,
+    "instances_total": 128,
+    "state_counts": {
+      "AUTO_ACCEPT_CANDIDATE": 4,
+      "HITL_LOW_SCORE": 3
+    },
+    "threshold": 0.8
+  },
+  "outcomes": {
+    "ambiguous_country_addresses": 0,
+    "ambiguous_country_instances": 0,
+    "extraction_errors": 0,
+    "instances_affected_by_errors": 0,
+    "reference_conflict_instances": 0,
+    "reference_status_counts": {
+      "consistent": 4,
+      "multi_country_annotated": 1,
+      "no_town_predicted": 1,
+      "reference_not_found": 1
+    },
+    "scenario_counts": {
+      "both_explicit": 4,
+      "no_defensible_prediction": 1,
+      "null_skip": 121,
+      "town_explicit_country_inferred": 2
+    }
+  },
+  "pass1": {
+    "empty_instances_skipped": 121,
+    "group_instances": 128,
+    "non_empty_instances": 7
+  },
+  "reference_data": {
+    "context_version": "iso3166-2026-08",
+    "google_search_grounding": false,
+    "provenance": {
+      "approved_for_production": false,
+      "dataset_version": "iso3166-2026-08",
+      "provider": "iso3166",
+      "records": 249,
+      "source_path": "/Users/krishnakumar/special_projects/swift_tc/data/reference/iso3166.csv"
+    },
+    "provider": "iso3166",
+    "town_country": {
+      "ambiguity_policy": "annotate",
+      "approved_for_production": false,
+      "configured_source": "development_local_reference",
+      "country_codes": 245,
+      "enabled": true,
+      "loaded": true,
+      "multi_country_towns": 4598,
+      "path": "/Users/krishnakumar/special_projects/swift_tc/data/reference/town_country_reference.csv",
+      "provider": "town_country",
+      "rows": 170511,
+      "source_dataset": "joelacus/world-cities (GeoNames-derived; population >= 1000)",
+      "source_url": "https://github.com/joelacus/world-cities",
+      "source_version": "commit 55bcdd6387eb17e3b12ef56860e42f34c30178f7 (build 20260810)",
+      "unique_towns": 160262
+    }
+  },
+  "run": {
+    "elapsed_seconds": 0.03,
+    "mode": "live",
+    "model": "gemini-3.5-flash",
+    "naming_style": "canonical",
+    "prompt_path": "/Users/krishnakumar/special_projects/swift_tc/prompts/GEMINI_EXTRACTION_PROMPT.md",
+    "prompt_version": "v6-lima-postal-inference",
+    "started_at_utc": "2026-08-16T19:20:29+00:00"
+  },
+  "shape": {
+    "appended_columns": 320,
+    "fields_per_group": 20,
+    "groups_configured": 16,
+    "groups_enabled": 16,
+    "input_columns": 50,
+    "input_rows": 8,
+    "output_columns": 370
+  }
+}

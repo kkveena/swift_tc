@@ -1,0 +1,5 @@
+threshold,auto_accept_candidate_count,auto_accept_candidate_percent,hitl_count,hitl_percent,ambiguous_forced_hitl_count,error_forced_hitl_count
+0.8,4,57.14,3,42.86,0,0
+0.85,4,57.14,3,42.86,0,0
+0.9,4,57.14,3,42.86,0,0
+0.95,4,57.14,3,42.86,0,0

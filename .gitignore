@@ -228,8 +228,14 @@ __marimo__/
 .streamlit/secrets.toml
 
 # --- SWIFT address extraction Phase 1 ---
-# Generated run artifacts. outputs/phase1_output.csv and address_cache.jsonl hold
-# raw addresses, so nothing generated here may reach version control. The README
-# is tracked so a fresh clone gets the directory and the warning that goes with it.
+# Generated run artifacts. outputs/phase1_output.csv, phase1_detailed_output.jsonl,
+# and address_cache.jsonl hold raw addresses, so those never reach version control.
+# The aggregate-only reporting artifacts (see outputs/README.md "Sensitivity") are
+# tracked so they can be shared as enterprise reference without exposing PII.
 outputs/*
 !outputs/README.md
+!outputs/run_metrics.json
+!outputs/reports/
+!outputs/reports/**
+!outputs/charts/
+!outputs/charts/**

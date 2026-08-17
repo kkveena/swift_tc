@@ -1,0 +1,9 @@
+metric,value,denominator
+Non-empty instances,7,instances
+Grounded observations,6,instances with any ground truth
+Ungrounded (excluded from loss),1,instances
+Mean cross-entropy,0.013487,grounded observations — lower is better
+Median cross-entropy,0.01005,grounded observations — lower is better
+P95 cross-entropy,0.025516,grounded observations — lower is better
+Town correctness rate,100.0,5 town-grounded instances
+Country correctness rate,100.0,5 country-grounded instances
