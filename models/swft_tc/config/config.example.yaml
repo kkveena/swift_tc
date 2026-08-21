@@ -1,0 +1,130 @@
+project:
+  prompt_version: "v2-composite-weighted"
+  record_id_column: "RECORD_ID"
+
+input:
+  preserve_all_columns: true
+  zero_field_is_missing: true
+
+output:
+  naming_style: "canonical"
+  country_candidate_separator: ","
+  country_candidate_sort: "alphabetical"
+  templates:
+    combined_address: "combined_address_group_{id}"
+    combined_address_cleaned: "combined_address_cleaned_group_{id}"
+    predicted_town: "predicted_town_group_{id}"
+    predicted_country: "predicted_country_group_{id}"
+    # Deterministic ISO expansion of predicted_country; never a model prediction.
+    predicted_country_name: "predicted_country_name_group_{id}"
+    predicted_town_probability: "predicted_town_probability_group_{id}"
+    predicted_country_probability: "predicted_country_probability_group_{id}"
+    predicted_town_exists: "predicted_town_exists_group_{id}"
+    predicted_country_exists: "predicted_country_exists_group_{id}"
+    composite_weighted_score: "composite_weighted_score_group_{id}"
+    rationale_town: "rationale_town_group_{id}"
+    rationale_country: "rationale_country_group_{id}"
+    # Nullable ground-truth correctness labels (blank = no evidence, not False).
+    town_exists_ok: "town_exists_ok_group_{id}"
+    country_exists_ok: "country_exists_ok_group_{id}"
+    # Binary cross-entropy against those labels; blank when ungrounded.
+    cross_entropy: "cross_entropy_group_{id}"
+    # Deterministic retraction of verified Town/Country evidence.
+    combined_address_retracted: "combined_address_retracted_group_{id}"
+    combined_address_retracted_comments: "combined_address_retracted_group_comments_{id}"
+    # Explicit HITL routing decision. HITL = Human-in-the-Loop. Deterministic
+    # Python policy: Gemini never chooses the state or writes the reason.
+    hitl_flag: "HITL_flag_group_{id}"
+    hitl_state: "HITL_state_group_{id}"
+    hitl_state_reason: "HITL_state_reason_group_{id}"
+  # Legacy aliases reproducing the original screenshot spellings. Selected by
+  # naming_style: "legacy". Exactly one naming set is ever emitted.
+  legacy_templates:
+    combined_address: "comined_address_group_{id}"
+    combined_address_cleaned: "comined_address_cleaned_group_{id}"
+    predicted_town: "predicted_town_group_{id}"
+    predicted_country: "predicted_countrty_group_{id}"
+    predicted_country_name: "predicted_countrty_name_group_{id}"
+    predicted_town_probability: "predicted_town_probability_group_{id}"
+    predicted_country_probability: "predicted_countrty_probability_group_{id}"
+    predicted_town_exists: "predicted_town_exists_group_{id}"
+    predicted_country_exists: "predicted_countrty_exists_group_{id}"
+    composite_weighted_score: "composite_weighted_score_group_{id}"
+    rationale_town: "rational_town_group_{id}"
+    rationale_country: "rational_countrty_group_{id}"
+    town_exists_ok: "town_exists_ok_group_{id}"
+    country_exists_ok: "countrty_exists_ok_group_{id}"
+    cross_entropy: "cross_entropy_group_{id}"
+    combined_address_retracted: "comined_address_retracted_group_{id}"
+    combined_address_retracted_comments: "comined_address_retracted_group_comments_{id}"
+    hitl_flag: "HITL_flag_group_{id}"
+    hitl_state: "HITL_state_group_{id}"
+    hitl_state_reason: "HITL_state_reason_group_{id}"
+
+model:
+  model_env_var: "GEMINI_MODEL"
+  default_model: "gemini-3.5-flash"
+  temperature: 0.0
+  max_output_tokens: 700
+  concurrency: 4
+  max_retries: 5
+  request_timeout_seconds: 60
+  checkpoint_every_unique_addresses: 100
+
+processing:
+  deduplicate_addresses: true
+  cache_enabled: true
+  cache_path: "outputs/address_cache.jsonl"
+  errors_path: "outputs/errors/processing_errors.csv"
+  metrics_path: "outputs/run_metrics.json"
+  redact_raw_address_in_logs: true
+  # Nested per-record detail; JSON Lines so large runs stream. Sensitive.
+  detailed_json_enabled: true
+  detailed_json_path: "outputs/phase1_detailed_output.jsonl"
+  detailed_json_format: "jsonl"
+
+reference_data:
+  provider: "null"
+  iso3166_path: "data/reference/iso3166.csv"
+  swiftref_enabled: false
+  # Town/Country development reference: an external runtime dependency, large
+  # and environment-specific. Never bundled or embedded; repoint the path at an
+  # enterprise-approved source without touching code.
+  town_country_enabled: true
+  town_country_path: "data/reference/town_country_reference.csv"
+  town_country_source: "development_local_reference"
+  town_country_approved_for_production: false
+  town_country_ambiguity_policy: "escalate"
+
+reporting:
+  enabled: true
+  reports_dir: "outputs/reports"
+  charts_dir: "outputs/charts"
+  score_band_edges: [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+  sensitivity_thresholds: [0.80, 0.85, 0.90, 0.95]
+  recommended_threshold: 0.90
+
+scoring:
+  mode: "composite_weighted"
+  hitl_threshold: 0.80
+  ambiguous_country_probability_override: 0.00
+  force_ambiguous_country_to_hitl: true
+  rules:
+    both_explicit:
+      town_weight: 1.00
+      country_weight: 1.00
+    country_explicit_town_inferred:
+      town_weight: 0.50
+      country_weight: 1.00
+    town_explicit_country_inferred:
+      town_weight: 0.75
+      country_weight: 0.50
+    town_explicit_country_ambiguous:
+      town_weight: 0.50
+      country_weight: 0.00
+    neither_explicit_both_inferred:
+      town_weight: 0.20
+      country_weight: 0.20
+    no_defensible_prediction:
+      town_weight: 0.00
+      country_weight: 0.00
