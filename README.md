@@ -24,7 +24,7 @@ This starter is intentionally notebook-first, but the implementation should plac
 - Group configuration: CSV or YAML; the supplied sample uses CSV.
 - Output: CSV preserving every input column and appending the configured columns for each group
   (20 today), plus a nested detailed JSONL for audit and evaluation depth.
-- Notebooks: `notebooks/01_phase1_address_extraction_DRY_RUN.ipynb` and `..._ACTUAL_RUN.ipynb`.
+- Notebooks: `notebooks/swft_tc/01_phase1_address_extraction_DRY_RUN.ipynb` and `..._ACTUAL_RUN.ipynb`.
 - Gemini model: configurable environment variable; default `gemini-3.5-flash`.
 - Credentials: environment variables only; never hard-code secrets in notebooks, source code, YAML, or committed files.
 - Structured JSON output from Gemini.
@@ -184,7 +184,7 @@ lines, usually one. Per-column before/after detail lives in the detailed JSON.
 ### Detailed nested output
 
 The CSV remains the flat compatibility artifact for spreadsheets and downstream flat-file consumers.
-Audit and evaluation depth lives in `outputs/phase1_detailed_output.jsonl` — one JSON object per
+Audit and evaluation depth lives in `models/swft_tc/outputs/phase1_detailed_output.jsonl` — one JSON object per
 input record, every enabled group nested inside — rather than growing dozens more columns.
 
 ```yaml
@@ -203,7 +203,7 @@ belongs in `run_metrics.json` and `executive_summary.json`.
 The writer **streams**: one record is built, serialized, and written before the next is touched, so
 peak memory is a single record. Unavailable numerics serialize as `null`; `allow_nan=False` makes
 emitting the invalid token `NaN` impossible. The file contains raw address data and is therefore
-sensitive — it stays under git-ignored `outputs/`.
+sensitive — it stays under git-ignored `models/swft_tc/outputs/`.
 
 ## Null-address first pass
 
@@ -396,7 +396,7 @@ every Phase 1 path; the documented exception is a manual override, which forces 
 }
 ```
 
-`outputs/reports/hitl_state_distribution.csv` reports the state mix over **non-empty** address-group
+`models/swft_tc/outputs/reports/hitl_state_distribution.csv` reports the state mix over **non-empty** address-group
 instances; null skips are excluded from the denominator.
 
 ### Provisional recommendation: 0.90
@@ -519,14 +519,20 @@ Set `SWIFT_ADDRESS_DRY_RUN=true` to force the offline stub even when credentials
 
 ### From Python
 
-```python
-from swift_address.grouping import load_group_config
-from swift_address.pipeline import run_phase1
-from swift_address.reference_data import build_provider, find_iso_provider
-from swift_address.schemas import load_prompt_contract
-from swift_address.settings import load_config, resolve_model_name
-from swift_address.gemini_client import build_client
+Run from the repository root. There is one import convention: modules are
+imported from `models.swft_tc.src`, the same way the tests, the notebooks and
+`scripts/swft_tc/run_batch.py` import them.
 
+```python
+from models.swft_tc.src.grouping import load_group_config
+from models.swft_tc.src.pipeline import run_phase1
+from models.swft_tc.src.reference_data import build_provider, find_iso_provider
+from models.swft_tc.src.schemas import load_prompt_contract
+from models.swft_tc.src.settings import load_config, resolve_model_name
+from models.swft_tc.src.gemini_client import build_client
+
+# Relative config and data paths resolve against the model root
+# (models/swft_tc/), never against the working directory.
 config = load_config("config/config.yaml")
 group_config = load_group_config(config.path(config.project.group_config_path))
 provider = build_provider(config.reference_data, base_dir=config.base_dir)
@@ -542,26 +548,28 @@ result = run_phase1("data/sample_input.csv", config, group_config,
 ### Tests
 
 ```bash
-python -m pytest          # 526 tests
+python -m pytest          # 526 tests, run from the repository root
 ```
 
-Tests never read the real Town/Country reference file. `tests/conftest.py` repoints
-`reference_data.town_country_path` at `tests/fixtures/town_country_reference_test.csv` and redirects
+Tests never read the real Town/Country reference file. `tests/swft_tc/conftest.py` repoints
+`reference_data.town_country_path` at `tests/swft_tc/fixtures/town_country_reference_test.csv` and redirects
 every output path into `tmp_path`, so the suite is hermetic and runs with no credentials, no network,
 and no large local data.
 
 ### Outputs
 
-Everything under `outputs/` is generated and git-ignored except `outputs/README.md`, which is
-tracked so a fresh clone gets the directory and its sensitivity warning. Every writer creates its
-parent directories, so deleting the tree is safe.
+Everything under `models/swft_tc/outputs/` is generated. Artifacts holding raw addresses are
+git-ignored; the aggregate-only reports, the run metrics and `outputs/README.md` are tracked so a
+fresh clone gets the directory, its sensitivity warning and shareable enterprise reference figures.
+Every writer creates its parent directories, so deleting the tree is safe. Paths below are relative
+to `models/swft_tc/`.
 
 | Path | Contents | Raw addresses |
 |---|---|---|
 | `outputs/phase1_output.csv` | every input column unchanged + 20 columns per enabled group | **Yes** |
 | `outputs/phase1_detailed_output.jsonl` | nested per-record detail (streamed JSON Lines) | **Yes** |
 | `outputs/address_cache.jsonl` | cached extractions + audit metadata | **Yes** |
-| `outputs/processing_errors.csv` | one row per failed unique address, referenced by SHA-256 | No |
+| `outputs/errors/processing_errors.csv` | one row per failed unique address, referenced by SHA-256 | No |
 | `outputs/run_metrics.json` | shape, savings, cache/call counts, scenario counts, HITL counts, reference-data provenance | No |
 | `outputs/reports/executive_summary.json` | headline KPIs for circulation | No |
 | `outputs/reports/score_distribution.csv` | composite-score bands over non-empty instances | No |
@@ -585,14 +593,15 @@ reference_data:
 Build a development copy — the script downloads from GeoNames and writes the expected schema:
 
 ```bash
-python scripts/build_geonames_town_country_reference.py \
-  --output data/reference/town_country_reference.csv
+python scripts/swft_tc/build_geonames_town_country_reference.py \
+  --output models/swft_tc/data/reference/town_country_reference.csv
 ```
 
 GeoNames Gazetteer data is licensed **CC BY 4.0 and requires attribution**; preserve it wherever the
-derived file or its outputs are distributed. `data/reference/*.csv` is git-ignored, so the file never
+derived file or its outputs are distributed. `models/swft_tc/data/reference/*.csv` is git-ignored
+(except the small tracked ISO 3166-1 table), so the file never
 enters version control. Unit tests use the tiny committed fixture
-`tests/fixtures/town_country_reference_test.csv` instead, never the real file.
+`tests/swft_tc/fixtures/town_country_reference_test.csv` instead, never the real file.
 
 If `town_country_enabled` is true and the file is missing, the pipeline **fails fast** with a message
 naming the builder script and the config keys. It does not fall back to web search or to the model's
@@ -600,7 +609,7 @@ geographic knowledge.
 
 ### Executive report
 
-`src/swift_address/reporting.py` builds the report; the notebook presents it. Three denominators are
+`models/swft_tc/src/reporting.py` builds the report; the notebook presents it. Three denominators are
 tracked separately and never mixed: **records**, **address-group instances** (split empty/non-empty),
 and **unique addresses**. The score distribution and threshold sensitivity both use *non-empty
 address-group instances*, since that is where review workload lands — empty instances are reported
@@ -611,12 +620,12 @@ separately and never pad the histogram.
 Decisions taken where the starter artifacts were silent or inconsistent. Each is configuration
 plus documentation rather than an assumption buried in code.
 
-1. **`config/config.yaml`** is the file the pipeline loads; `config.example.yaml` is left untouched
+1. **`models/swft_tc/config/config.yaml`** is the file the pipeline loads; `config.example.yaml` is left untouched
    as the supplied sample. Every key added beyond the example is marked `[EXTENSION]` in place.
    Override the path with `SWIFT_ADDRESS_CONFIG`.
-2. **`.env.example` and `data/reference/iso3166.csv` were referenced but absent** from the starter
+2. **`.env.example` and `models/swft_tc/data/reference/iso3166.csv` were referenced but absent** from the starter
    artifacts, and have been created. The ISO dataset is a *development fallback*; its status is
-   recorded in `data/reference/PROVENANCE.md`, reported by `Iso3166Provider.provenance`, and written
+   recorded in `models/swft_tc/data/reference/PROVENANCE.md`, reported by `Iso3166Provider.provenance`, and written
    into `run_metrics.json` on every run, so no run can quietly claim approved reference data.
 3. **`*_exists` is decided by the text, not by the model.** The predicted value is matched against
    the address on token boundaries (`AERONAUTICA` does not contain the token `RONA`). A model claim
@@ -655,7 +664,7 @@ plus documentation rather than an assumption buried in code.
     (`comined_`, `countrty`, `rational_`) are available as `output.naming_style: "legacy"`. Exactly
     one naming set is ever emitted; a test asserts the two never appear together.
 12. **Group 16 (`PRI_SNDR_CORR`) remains provisional**, as flagged in the starter notes. It is
-    enabled in `config/group_config.csv` and must be confirmed against the authoritative project
+    enabled in `models/swft_tc/config/group_config.csv` and must be confirmed against the authoritative project
     config before production use. Disabling it changes the column arithmetic automatically —
     nothing in the code knows the number 16.
 13. **Public web-search grounding is refused in code**, not merely defaulted off: constructing the
@@ -666,7 +675,7 @@ plus documentation rather than an assumption buried in code.
     an unknown code expands to itself rather than to a blank cell, and any separator character
     occurring *inside* a country name is folded to a space — several ISO short names are inverted
     forms (`Taiwan, Province of China`), and one of those would otherwise add a phantom element and
-    silently break the alignment contract. `data/reference/iso3166.csv` now stores comma-free
+    silently break the alignment contract. `models/swft_tc/data/reference/iso3166.csv` now stores comma-free
     display names, keeping the official inverted form as a matching alias.
 16. **The Town/Country reference validates; it does not overwrite.** Precedence is fixed and
     deterministic:
@@ -692,35 +701,69 @@ plus documentation rather than an assumption buried in code.
     live in the audit payload and `run_metrics.json`; the production schema stays at 12 fields.
 18. **Logs reference addresses by SHA-256**, never in plaintext, unless
     `SWIFT_ADDRESS_ALLOW_RAW_LOGS=true` is set in an approved debugging environment. The cache and
-    the audit payload hold the raw text because they *are* the audit record; `outputs/` is
+    the audit payload hold the raw text because they *are* the audit record;
+    `models/swft_tc/outputs/` is
     git-ignored for that reason.
 
 ## Repository layout
 
+The model is a self-contained unit under `models/swft_tc/`. Everything it owns —
+source, configuration, prompt contract, reference data and run artifacts — lives
+inside that directory; notebooks, scripts, tests and documentation sit in the
+repository's shared top-level folders under a matching `swft_tc/` subfolder.
+
 ```text
-config/config.yaml                     runtime config (loaded); config.example.yaml is the sample
-config/group_config.csv                16 groups x 3 lines; any N groups / N lines is supported
-data/reference/iso3166.csv             ISO 3166-1 development fallback (see PROVENANCE.md)
-data/reference/town_country_reference.csv   external runtime dependency; git-ignored, not bundled
-scripts/build_geonames_town_country_reference.py   builds the above from GeoNames (CC BY 4.0)
-prompts/GEMINI_EXTRACTION_PROMPT.md    single source of the prompt text
-notebooks/01_phase1_address_extraction.ipynb
-src/swift_address/                     settings, io, grouping, cleaning, schemas, reference_data,
+models/swft_tc/
+├── __init__.py                        exports MODEL_ROOT and REPO_ROOT: the single path anchor
+├── config/
+│   ├── config.yaml                    runtime config (loaded); config.example.yaml is the sample
+│   ├── config.example.yaml            sample runtime/scoring/naming configuration
+│   └── group_config.csv               16 groups x 3 lines; any N groups / N lines is supported
+├── data/
+│   ├── sample_input.csv               small 50-column sample input
+│   ├── sample_expected_group15.csv    expected Town/Country for the sample rows
+│   └── reference/
+│       ├── iso3166.csv                ISO 3166-1 development fallback (see PROVENANCE.md)
+│       ├── town_country_reference.csv external runtime dependency; git-ignored, not bundled
+│       └── PROVENANCE.md              source, licence and refresh policy for both files
+├── outputs/                           generated run artifacts; raw-address files git-ignored
+│   ├── errors/                        processing_errors.csv
+│   └── reports/                       aggregate-only report artifacts (tracked)
+├── prompts/
+│   └── GEMINI_EXTRACTION_PROMPT.md    single source of the prompt text
+└── src/                               settings, io, grouping, cleaning, schemas, reference_data,
                                        gemini_client, scoring, evaluation, retraction, cache,
                                        pipeline, reporting, serialization
-tests/                                 526 tests covering the acceptance criteria
-tests/fixtures/                        tiny Town/Country fixture used instead of the real file
-outputs/                               generated; git-ignored except outputs/README.md
+
+notebooks/swft_tc/                     DRY_RUN and ACTUAL_RUN walkthroughs
+scripts/swft_tc/
+├── run_batch.py                       batch entry point; argument parsing only, no business logic
+└── build_geonames_town_country_reference.py   builds the reference from GeoNames (CC BY 4.0)
+tests/swft_tc/                         526 tests covering the acceptance criteria
+└── fixtures/                          tiny Town/Country fixture used instead of the real file
+docs/swft_tc/                          architecture, scoring spec, provenance, prompt history
+```
+
+### Running it
+
+Every entry point runs from the repository root and resolves its own paths from
+the package location, so no step depends on the working directory:
+
+```bash
+python -m pytest                                  # 526 tests
+python scripts/swft_tc/run_batch.py --dry-run     # offline batch run, no credentials
+jupyter lab notebooks/swft_tc/                    # the notebook walkthroughs
 ```
 
 ## Starter artifacts
 
-- `architecture.md` — component and processing design.
-- `SCORING_SPEC.md` — Composite Weighted Score and ambiguity rules.
-- `CLAUDE_CODE_PROMPT.md` — master prompt to paste into Claude Code.
-- `prompts/GEMINI_EXTRACTION_PROMPT.md` — prompt contract for Gemini.
-- `config/group_config.csv` — 16-group sample configuration reconstructed from the screenshots/input schema.
-- `config/config.example.yaml` — runtime/scoring/naming configuration.
-- `.env.example` — environment variable names only.
-- `data/sample_input.csv` — small 50-column sample input reconstructed from screenshots.
-- `swift_project_reference.xlsx` — workbook version of group config, input schema, sample input, output schema, scoring rules, and expected examples.
+- `docs/swft_tc/architecture.md` — component and processing design.
+- `docs/swft_tc/SCORING_SPEC.md` — Composite Weighted Score and ambiguity rules.
+- `docs/swft_tc/REFERENCE_PROVENANCE.md` — where each reference table comes from and how it is refreshed.
+- `docs/swft_tc/prompt-history/` — the original and successive build prompts, kept for audit.
+- `docs/swft_tc/swift_project_reference.xlsx` — workbook version of group config, input schema, sample input, output schema, scoring rules, and expected examples.
+- `models/swft_tc/prompts/GEMINI_EXTRACTION_PROMPT.md` — prompt contract for Gemini.
+- `models/swft_tc/config/group_config.csv` — 16-group sample configuration reconstructed from the screenshots/input schema.
+- `models/swft_tc/config/config.example.yaml` — runtime/scoring/naming configuration.
+- `models/swft_tc/data/sample_input.csv` — small 50-column sample input reconstructed from screenshots.
+- `.env.example` — environment variable names only; no value is ever committed.
