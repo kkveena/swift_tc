@@ -102,6 +102,102 @@ class TestGroupCountIsConfigDriven:
         assert len(config.enabled_groups) == 1
 
 
+class TestCanonicalEnterpriseSchema:
+    """`group_id` plus source-field columns is the whole required schema.
+
+    `enabled` and `notes` are conveniences a development configuration may
+    carry. The enterprise file does not, and must not have to.
+    """
+
+    def _write(self, tmp_path, text: str, name: str = "groups.csv"):
+        path = tmp_path / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_canonical_file_needs_neither_optional_column(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            "group_id,address_line_1,address_line_2,address_line_3\n"
+            "1,A1,A2,A3\n"
+            "2,B1,B2,B3\n",
+        )
+        config = load_group_config(path)
+        assert len(config.groups) == 2
+        assert len(config.enabled_groups) == 2
+        assert [g.notes for g in config.groups] == ["", ""]
+        assert config.groups[0].source_fields == ("A1", "A2", "A3")
+
+    def test_a_file_without_enabled_activates_every_group(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            "group_id,address_line_1,notes\n"
+            "1,A1,first\n"
+            "2,B1,second\n"
+            "3,C1,third\n",
+        )
+        config = load_group_config(path)
+        assert len(config.enabled_groups) == 3
+        assert [g.notes for g in config.groups] == ["first", "second", "third"]
+
+    def test_a_file_without_notes_loads_with_empty_notes(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            "group_id,address_line_1,enabled\n"
+            "1,A1,True\n"
+            "2,B1,False\n",
+        )
+        config = load_group_config(path)
+        assert [g.notes for g in config.groups] == ["", ""]
+        assert [g.group_id for g in config.enabled_groups] == ["1"]
+
+    def test_legacy_file_with_both_columns_still_works(self, tmp_path):
+        """Backwards compatibility: an existing development file is unaffected."""
+        path = self._write(
+            tmp_path,
+            "group_id,address_line_1,enabled,notes\n"
+            "1,A1,True,test\n"
+            "2,B1,False,test\n",
+        )
+        config = load_group_config(path)
+        assert len(config.groups) == 2
+        assert [g.group_id for g in config.enabled_groups] == ["1"]
+        assert [g.notes for g in config.groups] == ["test", "test"]
+
+    def test_canonical_schema_keeps_variable_width_groups(self, tmp_path):
+        """No optional column, and still no assumption of three lines."""
+        path = self._write(
+            tmp_path,
+            "group_id,address_line_1,address_line_2,address_line_3,address_line_4\n"
+            "1,A1,A2,A3,A4\n"
+            "2,B1,B2,,\n"
+            "3,C1,,,\n",
+        )
+        config = load_group_config(path)
+        assert [g.line_count for g in config.groups] == [4, 2, 1]
+        assert len(config.enabled_groups) == 3
+
+    def test_group_id_alone_is_not_enough(self, tmp_path):
+        path = self._write(tmp_path, "group_id\n1\n")
+        with pytest.raises(GroupConfigError, match="no address-line columns"):
+            load_group_config(path)
+
+
+class TestShippedEnterpriseGroupConfig:
+    """The file the pipeline actually loads must be the canonical schema."""
+
+    def test_shipped_file_carries_no_optional_columns(self, model_root):
+        header = (
+            (model_root / "config" / "group_config.csv")
+            .read_text(encoding="utf-8-sig")
+            .splitlines()[0]
+        )
+        assert header == "group_id,address_line_1,address_line_2,address_line_3"
+
+    def test_every_shipped_group_is_active(self, group_config):
+        assert len(group_config.groups) == len(group_config.enabled_groups) == 16
+        assert all(group.notes == "" for group in group_config.groups)
+
+
 class TestGroupConfigValidation:
     def test_duplicate_group_ids_are_rejected(self):
         with pytest.raises(GroupConfigError, match="duplicate group_id"):
@@ -200,3 +296,49 @@ class TestCombinedAddressConstruction:
         combined, cleaned = build_group_addresses(row, group)
         assert combined == "1 LINCOLN   STREET BOSTON MA 02111 US"
         assert cleaned == "1 LINCOLN STREET BOSTON MA 02111 US"
+
+
+class TestCanonicalSchemaRunsEndToEnd:
+    """The canonical enterprise file must survive a real pipeline run.
+
+    Loading is not enough: a schema change that quietly disabled every group
+    would still load fine and then process nothing.
+    """
+
+    def test_a_canonical_config_produces_the_full_output(
+        self, config, tmp_path, reference_provider, town_country_provider,
+        mock_client, sample_input_path, model_root,
+    ):
+        from models.swft_tc.src.io import read_input_csv
+        from models.swft_tc.src.pipeline import Phase1Pipeline
+
+        # Rebuild the shipped config as a canonical file with neither optional
+        # column, then run the pipeline against it.
+        shipped = load_group_config(model_root / "config" / "group_config.csv")
+        header = "group_id," + ",".join(
+            f"address_line_{index + 1}"
+            for index in range(max(g.line_count for g in shipped.groups))
+        )
+        rows = [
+            ",".join([group.group_id, *group.source_fields])
+            for group in shipped.groups
+        ]
+        path = tmp_path / "canonical_groups.csv"
+        path.write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
+
+        canonical = load_group_config(path)
+        assert len(canonical.enabled_groups) == len(shipped.groups) == 16
+
+        frame = read_input_csv(sample_input_path)
+        result = Phase1Pipeline(
+            config, canonical, client=mock_client,
+            reference_provider=reference_provider,
+            town_country_provider=town_country_provider, mode="dry_run",
+        ).run(frame)
+
+        expected_width = len(frame.columns) + 16 * config.fields_per_group
+        assert result.frame.shape == (len(frame), expected_width)
+        assert not result.errors
+        # Every configured group produced its columns, so none was silently off.
+        for group in canonical.enabled_groups:
+            assert f"predicted_town_group_{group.group_id}" in result.frame.columns

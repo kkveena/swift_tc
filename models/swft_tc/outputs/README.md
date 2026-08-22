@@ -43,7 +43,19 @@ so those are the ones safe to circulate.
 | `reports/threshold_sensitivity.csv` | `reporting.write_reports` | No |
 | `reports/cross_entropy_summary.csv` | `reporting.write_reports` | No |
 | `reports/hitl_state_distribution.csv` | `reporting.write_reports` | No |
+| `reports/threshold_tradeoff.csv` | `reporting.write_reports` | No |
+| `reports/precision_coverage.csv` | `reporting.write_reports` (labels permitting) | No |
+| `reports/error_capture_gain.csv` | `reporting.write_reports` (labels permitting) | No |
+| `reports/error_capture_lift.csv` | `reporting.write_reports` (labels permitting) | No |
 | `charts/composite_score_histogram.png` | `reporting.render_score_histogram` | No |
+| `charts/threshold_tradeoff.png` | `reporting.render_threshold_tradeoff_chart` | No |
+| `charts/precision_coverage.png` | `reporting.render_precision_coverage_chart` | No |
+| `charts/error_capture_gain.png` | `reporting.render_error_capture_gain_chart` | No |
+| `charts/error_capture_lift.png` | `reporting.render_error_capture_lift_chart` | No |
+
+The precision/coverage and error-capture artifacts need independent ground truth. When a run does
+not have enough of it, they are **not written at all** and the report states why — an empty file
+would read as "the analysis ran and found nothing", which is a different claim.
 
 ## Paths are configuration
 

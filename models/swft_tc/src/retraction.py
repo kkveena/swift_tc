@@ -42,6 +42,7 @@ __all__ = [
     "null_retraction",
     "remove_token_phrases",
     "retract_group",
+    "token_phrase_matches",
     "token_spans",
 ]
 
@@ -73,6 +74,12 @@ class RetractionResult:
     comment: str
     retracted_entities: tuple[str, ...] = ()
     removed_forms: tuple[str, ...] = ()
+    #: How many standalone Town occurrences the group's source fields carried,
+    #: and how many were actually removed. At most one is ever removed, so a
+    #: count above one is the audit record of a repeated Town that was
+    #: deliberately left partly in place. Audit only — never a CSV column.
+    town_occurrences_found: int = 0
+    town_occurrences_removed: int = 0
 
     @property
     def changed(self) -> bool:
@@ -86,6 +93,8 @@ class RetractionResult:
             "actual_column_after_retraction": dict(self.after),
             "retracted_entities": list(self.retracted_entities),
             "removed_forms": list(self.removed_forms),
+            "town_occurrences_found": self.town_occurrences_found,
+            "town_occurrences_removed": self.town_occurrences_removed,
         }
 
 
@@ -109,18 +118,73 @@ def token_spans(text: str) -> tuple[TokenSpan, ...]:
     return tuple(spans)
 
 
+def token_phrase_matches(
+    text: str,
+    phrase: str,
+    *,
+    restrict_to_trailing_tokens: int | None = None,
+) -> tuple[tuple[int, int], ...]:
+    """Every standalone token-phrase occurrence of ``phrase``, in text order.
+
+    Returns ``(first_token_index, last_token_index)`` pairs over the token
+    sequence of ``text``. Matching is exactly the matching
+    :func:`remove_token_phrases` performs — whole tokens, case-insensitive, so a
+    phrase occurring only inside a longer word is not a match. Occurrences never
+    overlap: a match consumes its tokens before the scan continues.
+
+    Exposed so a caller can decide *which* occurrence to act on before removing
+    anything — the group-level Town rule needs to count occurrences across
+    several fields before touching any of them.
+    """
+    spans = token_spans(text or "")
+    if not spans:
+        return ()
+    keys = [span.key for span in spans]
+    needle = [
+        unicodedata.normalize("NFKC", token.text).upper()
+        for token in token_spans(phrase or "")
+    ]
+    return _matches(keys, needle, restrict_to_trailing_tokens)
+
+
+def _matches(
+    keys: Sequence[str],
+    needle: Sequence[str],
+    restrict_to_trailing_tokens: int | None,
+) -> tuple[tuple[int, int], ...]:
+    """Non-overlapping token-index matches of ``needle`` within ``keys``."""
+    if not needle or len(needle) > len(keys):
+        return ()
+    earliest_end = (
+        len(keys) - restrict_to_trailing_tokens
+        if restrict_to_trailing_tokens is not None
+        else 0
+    )
+    found: list[tuple[int, int]] = []
+    index = 0
+    while index <= len(keys) - len(needle):
+        end_index = index + len(needle) - 1
+        if list(keys[index : index + len(needle)]) == list(needle) and end_index >= earliest_end:
+            found.append((index, end_index))
+            index += len(needle)
+        else:
+            index += 1
+    return tuple(found)
+
+
 def remove_token_phrases(
     text: str,
     phrases: Iterable[str],
     *,
     restrict_to_trailing_tokens: int | None = None,
+    max_occurrences: int | None = None,
+    prefer_last: bool = False,
 ) -> tuple[str, tuple[str, ...]]:
-    """Remove every standalone token-phrase occurrence of each phrase.
+    """Remove standalone token-phrase occurrences of each phrase.
 
     Returns ``(new_text, removed_forms)``. Matching is case-insensitive and
     aligned to whole tokens, so a phrase occurring only as a substring of a
-    longer word is not a match and is not removed. Repeated occurrences are all
-    removed (``CITIGROUP CENTRE AUCKLAND AUCKLAND`` → ``CITIGROUP CENTRE``).
+    longer word is not a match and is not removed.
 
     Each removed token span also swallows one adjacent run of separator
     characters — the preceding run when there is one, otherwise the following —
@@ -132,9 +196,23 @@ def remove_token_phrases(
     the final N tokens. This is what keeps an ambiguous alpha-2 code such as
     ``IN`` from being stripped out of ordinary prose: only the trailing
     country-position occurrence is eligible.
+
+    ``max_occurrences`` caps how many occurrences of *each* phrase are removed.
+    The default ``None`` removes every eligible occurrence, which is what
+    Country retraction wants — a country code repeated in the text is the same
+    single piece of evidence stated twice. ``max_occurrences=1`` with
+    ``prefer_last=True`` removes only the right-most occurrence, which is what
+    the Town rule wants: an earlier occurrence can belong to an institution or
+    building name, so only the later, locality-position one is taken out.
+
+    Note the cap is per phrase *per call*. A rule that limits occurrences across
+    several fields must decide which field to act on first — see
+    :func:`token_phrase_matches`.
     """
     original = text or ""
     if not original.strip():
+        return original, ()
+    if max_occurrences is not None and max_occurrences <= 0:
         return original, ()
 
     spans = token_spans(original)
@@ -150,30 +228,19 @@ def remove_token_phrases(
             unicodedata.normalize("NFKC", token.text).upper()
             for token in token_spans(phrase or "")
         ]
-        if not needle or len(needle) > len(keys):
+        found = _matches(keys, needle, restrict_to_trailing_tokens)
+        if not found:
             continue
-
-        earliest_end = (
-            len(keys) - restrict_to_trailing_tokens
-            if restrict_to_trailing_tokens is not None
-            else 0
-        )
-
-        matched = False
-        index = 0
-        while index <= len(keys) - len(needle):
-            end_index = index + len(needle) - 1
-            if keys[index : index + len(needle)] == needle and end_index >= earliest_end:
-                first, last = spans[index], spans[end_index]
-                removals.append(
-                    _expanded_span(original, first.start, last.end, index == 0)
-                )
-                matched = True
-                index += len(needle)
-            else:
-                index += 1
-        if matched:
-            removed_forms.append(phrase)
+        if max_occurrences is not None:
+            found = (
+                found[-max_occurrences:] if prefer_last else found[:max_occurrences]
+            )
+        for start_index, end_index in found:
+            first, last = spans[start_index], spans[end_index]
+            removals.append(
+                _expanded_span(original, first.start, last.end, start_index == 0)
+            )
+        removed_forms.append(phrase)
 
     if not removals:
         return original, ()
@@ -286,10 +353,35 @@ def retract_group(
     )
     tail_field = _last_non_empty_field(before, source_fields)
 
+    # --- Town: at most ONE occurrence per GROUP, the right-most one ---------
+    # A Town can legitimately appear more than once in one address — once inside
+    # an institution, building or branch name, and once as the locality itself
+    # ("CITIGROUP CENTRE AUCKLAND AUCKLAND"). Removing every occurrence deletes
+    # part of the organisation's name along with the location. Only one
+    # occurrence is evidence of the locality, so only one is retracted.
+    #
+    # Which one is a deterministic positional choice, not a semantic guess: the
+    # right-most standalone occurrence across the configured source fields in
+    # configuration order, because the locality sits later in an address than a
+    # descriptive prefix does. The scan spans the whole group, so a Town in the
+    # final line wins over an earlier one in a previous line.
+    town_occurrences_found = 0
+    town_target_field = ""
+    if retract_town:
+        for field_name in source_fields:
+            value = before[field_name]
+            if not value:
+                continue
+            occurrences = len(token_phrase_matches(value, town))
+            if occurrences:
+                town_occurrences_found += occurrences
+                town_target_field = field_name
+
     after: dict[str, str] = {}
     removed_forms: list[str] = []
     town_removed = False
     country_removed = False
+    town_occurrences_removed = 0
 
     def _note(form: str) -> None:
         nonlocal town_removed, country_removed
@@ -306,10 +398,27 @@ def retract_group(
             after[field_name] = value
             continue
 
-        phrases: list[str] = ([town] if retract_town else []) + open_forms
-        updated, removed = remove_token_phrases(value, phrases)
-        for form in removed:
-            _note(form)
+        updated = value
+
+        # Town first, so the single occurrence is chosen against the field text
+        # exactly as it was written rather than against a country-stripped
+        # remnant. Only the one field carrying the right-most occurrence is
+        # touched; every earlier occurrence, in this field or any other, stays.
+        if retract_town and field_name == town_target_field:
+            updated, removed = remove_token_phrases(
+                updated, [town], max_occurrences=1, prefer_last=True
+            )
+            for form in removed:
+                _note(form)
+                town_occurrences_removed += 1
+
+        # Country keeps its existing rule: every verified occurrence goes, since
+        # a country code repeated in the text is one piece of evidence stated
+        # twice, not two separate facts.
+        if open_forms:
+            updated, removed = remove_token_phrases(updated, open_forms)
+            for form in removed:
+                _note(form)
 
         if restricted_code and field_name == tail_field:
             updated, removed = remove_token_phrases(
@@ -338,6 +447,8 @@ def retract_group(
         comment=_comment(town_removed, country_removed, town, code, tuple(removed_forms)),
         retracted_entities=tuple(entities),
         removed_forms=tuple(removed_forms),
+        town_occurrences_found=town_occurrences_found,
+        town_occurrences_removed=town_occurrences_removed,
     )
 
 

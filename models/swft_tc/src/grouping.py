@@ -144,19 +144,32 @@ class GroupConfig:
 def load_group_config(path: str | Path) -> GroupConfig:
     """Load a group configuration from CSV or YAML.
 
-    CSV schema (the supplied sample)::
+    Canonical CSV schema::
 
-        group_id,address_line_1,address_line_2,address_line_3,enabled,notes
+        group_id,address_line_1,address_line_2,address_line_3
+        1,A1,A2,A3
+        2,B1,B2,B3
 
-    Any number of ``address_line_*`` columns is accepted, in column order.
-    A blank line cell simply means that group has fewer lines.
+    Only ``group_id`` plus at least one source-field column is required. Any
+    number of address-line columns is accepted, in column order, so a
+    configuration is free to use two lines, three, or ten — nothing here assumes
+    a width. A blank line cell simply means that group has fewer lines.
+
+    ``enabled`` and ``notes`` are **optional**. A file that omits them — the
+    canonical enterprise form above — loads with every configured group active
+    and empty notes. A file that carries them is still honoured, so an existing
+    development configuration keeps working unchanged::
+
+        group_id,address_line_1,enabled,notes
+        1,A1,True,in scope
+        2,B1,False,retired
 
     YAML schema::
 
         groups:
           - group_id: "1"
             source_fields: [ADDR_1, ADDR_2]
-            enabled: true
+            enabled: true      # optional, defaults to true
     """
     config_path = Path(path)
     if not config_path.exists():
@@ -215,7 +228,14 @@ def _load_csv_groups(path: Path) -> list[AddressGroup]:
                 AddressGroup(
                     group_id=group_id,
                     source_fields=fields,
-                    enabled=_parse_bool(normalized.get("enabled", "true"), path, line_number),
+                    # Both columns are optional. When the header omits them the
+                    # key is simply absent, so the canonical enterprise file
+                    # loads with every group enabled and un-annotated. A file
+                    # that still carries them keeps its existing meaning,
+                    # including a blank `enabled` cell meaning disabled.
+                    enabled=_parse_bool(
+                        normalized.get("enabled", "true"), path, line_number
+                    ),
                     notes=normalized.get("notes", ""),
                 )
             )

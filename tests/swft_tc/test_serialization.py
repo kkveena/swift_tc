@@ -196,8 +196,11 @@ class TestAgreementWithCsv:
             assert value == row[field_name]
 
         assert before["PRI_PAY_BNF_ADDR_LINE_2"] == "CITIGROUP CENTRE AUCKLAND AUCKLAND"
-        assert after["PRI_PAY_BNF_ADDR_LINE_2"] == "CITIGROUP CENTRE"
+        # One Town occurrence per group, so one AUCKLAND survives.
+        assert after["PRI_PAY_BNF_ADDR_LINE_2"] == "CITIGROUP CENTRE AUCKLAND"
         assert retraction["retracted_entities"] == ["town", "country"]
+        assert retraction["town_occurrences_found"] == 2
+        assert retraction["town_occurrences_removed"] == 1
 
     def test_rebuilt_combined_matches_the_after_columns(self, documents):
         from models.swft_tc.src.cleaning import clean_address

@@ -34,6 +34,38 @@ This starter is intentionally notebook-first, but the implementation should plac
 - Retry/backoff for transient errors and 429 responses.
 - Sidecar processing-error log rather than silently converting failed LLM calls to valid predictions.
 
+## Group configuration
+
+Groups are external data, never code. The pipeline supports any number of groups and any number of
+address lines per group; nothing in the source knows that the supplied sample happens to use 16
+groups of 3 lines.
+
+The canonical enterprise schema is `group_id` plus one or more source-field columns, and nothing
+else:
+
+```text
+group_id,address_line_1,address_line_2,address_line_3
+1,INT_PAY_AGT_ADDR_1,INT_PAY_AGT_ADDR_2,INT_PAY_AGT_ADDR_3
+2,INT_PAY_AGT_AGT_ADDR_1,INT_PAY_AGT_AGT_ADDR_2,INT_PAY_AGT_AGT_ADDR_3
+```
+
+`enabled` and `notes` are **optional**. `models/swft_tc/config/group_config.csv` — the file the
+pipeline actually loads — carries neither, so every configured group is active. A blank line cell
+simply means that group has fewer lines.
+
+An existing development configuration that still carries the optional columns keeps working
+unchanged, so nothing has to be migrated:
+
+```text
+group_id,address_line_1,enabled,notes
+1,A1,True,in scope
+2,B1,False,retired
+```
+
+When `enabled` is absent, every group is enabled. When `notes` is absent, notes are empty. A file
+with only `group_id` and no source-field column is rejected — that is a real misconfiguration, not a
+default. YAML is also accepted, with the same optional-`enabled` rule.
+
 ## Required output columns per configured group
 
 For `group15`, the canonical names are:
@@ -159,9 +191,23 @@ columns are never modified.
 Safety properties, all tested: `AERONAUTICA` cannot lose `RONA`; `CUSTOMS` cannot lose `US`; an
 ambiguous code such as `IN` is removed only where country verification concluded it really meant
 India — and that trailing-position judgement is made against the **combined** address, because a
-token sitting mid-address can be in the trailing window of its own short field. Repeated standalone
-occurrences are all removed (`CITIGROUP CENTRE AUCKLAND AUCKLAND` → `CITIGROUP CENTRE`); postal codes
-survive (`1140 NZ` → `1140`); surviving text keeps its original casing.
+token sitting mid-address can be in the trailing window of its own short field. Postal codes survive
+(`1140 NZ` → `1140`); surviving text keeps its original casing.
+
+**A repeated Town loses exactly one occurrence, per group.** An address can legitimately name the
+same town twice — once inside an institution, building or branch name and once as the locality
+itself. Removing every occurrence deletes part of the organisation's name along with the location,
+so only one occurrence is retracted, and it is the **right-most standalone occurrence across the
+group's configured source fields**. The choice is positional and deterministic: the locality sits
+later in an address than a descriptive prefix does. Nothing here guesses at meaning, and the scan
+spans the whole group — a Town in the final line wins over an earlier one on a previous line.
+
+Country retraction is deliberately *not* capped: a country code stated twice is one piece of
+evidence repeated, not two separate facts, so every verified occurrence goes.
+
+`combined_address_cleaned` is untouched by any of this. Cleaning is normalization, not entity
+deduplication, so a source that says `AUCKLAND AUCKLAND` still reads `AUCKLAND AUCKLAND` there. Only
+`combined_address_retracted_group_<id>` changes.
 
 Example:
 
@@ -171,15 +217,26 @@ before  LINE_1  23 CUSTOMS STREET EAST LEVEL 11
         LINE_3  1140 NZ
 
 after   LINE_1  23 CUSTOMS STREET EAST LEVEL 11
-        LINE_2  CITIGROUP CENTRE
-        LINE_3  1140
+        LINE_2  CITIGROUP CENTRE AUCKLAND       <- one AUCKLAND retracted, one kept
+        LINE_3  1140                            <- NZ retracted
 
-combined_address_retracted = "23 CUSTOMS STREET EAST LEVEL 11 CITIGROUP CENTRE 1140"
+combined_address_cleaned   = "... CITIGROUP CENTRE AUCKLAND AUCKLAND 1140 NZ"   (unchanged)
+combined_address_retracted = "23 CUSTOMS STREET EAST LEVEL 11 CITIGROUP CENTRE AUCKLAND 1140"
 comment = "Retracted Town=AUCKLAND and Country=NZ from verified explicit address evidence."
 ```
 
+A Town repeated across lines behaves the same way — only the last occurrence goes:
+
+```text
+before  LINE_1  441-445 JIRON SANTA ROSA        after  441-445 JIRON SANTA ROSA
+        LINE_2  LIMA                                   LIMA
+        LINE_3  METRO MUNIC OF LIMA 15001              METRO MUNIC OF 15001
+```
+
 The comment is generated deterministically in Python (never by the model) and is at most three
-lines, usually one. Per-column before/after detail lives in the detailed JSON.
+lines, usually one. Per-column before/after detail lives in the detailed JSON, alongside
+`town_occurrences_found` / `town_occurrences_removed` so a partly-retained repeat is auditable. No
+new CSV column is added for it.
 
 ### Detailed nested output
 
@@ -422,14 +479,50 @@ requires roughly 0.95 on both confidences if the two are similar (`0.95 × 0.95 
 between 0.3750 and 0.5000 the threshold makes no practical difference at all: no scenario produces
 scores there.
 
-**Choose the production threshold from labeled validation data.** Once labels exist, extend
-`threshold_sensitivity.csv` with precision of the auto-accepted population, its error rate, and
-recall/coverage, then apply the governance criterion: **select the lowest threshold that still meets
-the business-approved minimum precision** — optimize for precision at an accepted review cost, not
-for throughput.
+**Choose the production threshold from labeled validation data.** The governance criterion is:
+**select the lowest threshold that still meets the business-approved minimum precision for the
+auto-accepted population, while keeping HITL workload operationally acceptable** — optimize for
+precision at an accepted review cost, not for throughput.
 
-Ambiguity, extraction errors, and model/reference conflicts force HITL at every threshold, so the
-sensitivity table reports those forced counts separately from the score-driven ones.
+Four forced-review controls override the number at *every* threshold, including 0.00: a processing
+error, a manual override, unresolved Country ambiguity, and a deterministic model/reference conflict.
+Every reporting path — the sensitivity table, the KPI table, the executive summary and all threshold
+curves — applies the same `reporting.forced_review_mask()`, so lowering the cutoff can never turn a
+reference-conflicted case into an auto-accept candidate in any artifact. Forced counts are reported
+separately from the score-driven ones.
+
+### Threshold analytics
+
+Four analyses, answering four different questions. Only one of them measures quality, and **none of
+them changes `scoring.hitl_threshold`** — that stays configuration, changed only by an approved
+configuration change.
+
+| Artifact | Question | Requires labels? |
+|---|---|---|
+| `reports/threshold_sensitivity.csv` | routing volume at each configured candidate threshold | No |
+| `reports/threshold_tradeoff.csv`, `charts/threshold_tradeoff.png` | how does review workload respond across the whole 0.00–1.00 grid? | No |
+| `reports/precision_coverage.csv`, `charts/precision_coverage.png` | how good is what we would auto-accept, and how much does it cover? | **Yes** — Town *and* Country |
+| `reports/error_capture_gain.csv`, `charts/error_capture_gain.png` | reviewing lowest-score-first, how fast are real errors reached? | **Yes**, plus ≥1 labelled error |
+| `reports/error_capture_lift.csv`, `charts/error_capture_lift.png` | how many times better than random is that ranking? | as above |
+
+The **trade-off curve** is workload analysis. It shows what a cutoff costs to operate and says
+nothing about whether the auto-accepted population is correct, so a bend in it is *not* evidence for
+a production threshold. The chart marks the configured operational threshold and the analytical
+recommendation from configuration; neither is derived from the curve's shape.
+
+**Precision vs coverage** is the curve a cutoff should be argued from. It uses only *fully grounded*
+observations — both Town and Country independently labelled — and a group counts as correct only when
+both halves are. Partially labelled observations are excluded from numerator and denominator alike.
+
+**Error-capture Gain/Lift** answers the prioritisation question: if reviewers work the queue lowest
+score first, how quickly do they reach the cases that are actually wrong? Lift is
+`errors_captured_% / reviewed_population_%` — review 20% and find 60% of the errors and the lift is
+3.0. With too few labelled errors, **no chart is produced**; the report states that the analysis is
+unavailable and why. A missing Gain chart means the labels are missing, not that the model is
+error-free.
+
+Filenames, the grid step (`threshold_curve_step`) and the minimum label counts are all under
+`config.reporting`; nothing hard-codes a path or a threshold.
 
 ## Token/cost controls
 
@@ -577,7 +670,18 @@ to `models/swft_tc/`.
 | `outputs/reports/threshold_sensitivity.csv` | routing volume at each candidate threshold | No |
 | `outputs/reports/cross_entropy_summary.csv` | calibration over grounded observations only | No |
 | `outputs/reports/hitl_state_distribution.csv` | HITL routing-state mix over non-empty instances | No |
+| `outputs/reports/threshold_tradeoff.csv` | auto-accept vs review workload across the full threshold grid | No |
+| `outputs/reports/precision_coverage.csv` | auto-accept precision vs coverage, fully grounded observations only | No |
+| `outputs/reports/error_capture_gain.csv` | cumulative error capture by lowest-score-first review | No |
+| `outputs/reports/error_capture_lift.csv` | the same ranking expressed as lift over random review | No |
 | `outputs/charts/composite_score_histogram.png` | the score distribution as a chart | No |
+| `outputs/charts/threshold_tradeoff.png` | the workload trade-off curve | No |
+| `outputs/charts/precision_coverage.png` | precision against coverage, with the thresholds marked | No |
+| `outputs/charts/error_capture_gain.png` | error capture against the random-review baseline | No |
+| `outputs/charts/error_capture_lift.png` | lift against review depth | No |
+
+The last four report CSVs and the last three charts are produced only when the run's labels support
+them; when they do not, the report says so rather than writing an empty or misleading artifact.
 
 ### Town/Country reference data (external runtime dependency)
 
@@ -718,7 +822,7 @@ models/swft_tc/
 ├── config/
 │   ├── config.yaml                    runtime config (loaded); config.example.yaml is the sample
 │   ├── config.example.yaml            sample runtime/scoring/naming configuration
-│   └── group_config.csv               16 groups x 3 lines; any N groups / N lines is supported
+│   └── group_config.csv               group_id + address-line columns; any N groups / N lines
 ├── data/
 │   ├── sample_input.csv               small 50-column sample input
 │   ├── sample_expected_group15.csv    expected Town/Country for the sample rows
@@ -763,7 +867,7 @@ jupyter lab notebooks/swft_tc/                    # the notebook walkthroughs
 - `docs/swft_tc/prompt-history/` — the original and successive build prompts, kept for audit.
 - `docs/swft_tc/swift_project_reference.xlsx` — workbook version of group config, input schema, sample input, output schema, scoring rules, and expected examples.
 - `models/swft_tc/prompts/GEMINI_EXTRACTION_PROMPT.md` — prompt contract for Gemini.
-- `models/swft_tc/config/group_config.csv` — 16-group sample configuration reconstructed from the screenshots/input schema.
+- `models/swft_tc/config/group_config.csv` — 16-group configuration in the canonical enterprise schema (`group_id` + address-line columns only).
 - `models/swft_tc/config/config.example.yaml` — runtime/scoring/naming configuration.
 - `models/swft_tc/data/sample_input.csv` — small 50-column sample input reconstructed from screenshots.
 - `.env.example` — environment variable names only; no value is ever committed.

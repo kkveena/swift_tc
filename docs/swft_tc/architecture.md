@@ -153,11 +153,18 @@ The notebook should orchestrate and demonstrate the pipeline; it should not cont
 ### Group configuration
 Each row defines a group and ordered source fields. The code must support any number of groups and should not assume exactly 3 address lines, although the current config uses 3.
 
-Recommended schema:
+Canonical enterprise schema — `group_id` plus one or more source-field columns, nothing else:
 
 ```text
-group_id,address_line_1,address_line_2,address_line_3,enabled,notes
+group_id,address_line_1,address_line_2,address_line_3
+1,A1,A2,A3
+2,B1,B2,B3
 ```
+
+`enabled` and `notes` are optional. A file that omits them loads with every group active and empty
+notes; a file that still carries them keeps its existing meaning, so an existing development
+configuration needs no migration. The loader requires only `group_id` and at least one source-field
+column, and imposes no fixed number of lines per group.
 
 ### Runtime configuration
 Keep model, batch, concurrency, scoring, naming templates, HITL threshold, and reference-provider settings in YAML/environment variables.
@@ -353,6 +360,24 @@ The ambiguous-alpha2 trailing-position rule is evaluated against the **combined*
 individual field: a token in the middle of an address can sit inside the trailing window of its own
 short field, which would otherwise strip the preposition out of "SUITE 5 IN TOWER".
 
+**Town is retracted at most once per group.** A repeated Town is one locality stated twice — often
+once inside an institution or building name and once as the locality itself — so removing every
+occurrence would delete part of the organisation's name. Exactly one occurrence goes, and it is the
+right-most standalone occurrence across the group's configured source fields, chosen positionally:
+the locality sits later in an address than a descriptive prefix does. The scan spans the whole group
+before anything is removed, so a Town on the final line wins over an earlier one. Country retraction
+is *not* capped — a country code repeated in the text is one piece of evidence stated twice.
+
+`combined_address_cleaned` is unaffected. Cleaning is normalization, not entity deduplication, so a
+source reading `AUCKLAND AUCKLAND` still reads that way there; only
+`combined_address_retracted_group_<id>` changes. `town_occurrences_found` and
+`town_occurrences_removed` are recorded in the detailed JSON retraction block so a partly-retained
+repeat is auditable, and no CSV column is added for them.
+
+The cap is expressed through `remove_token_phrases(..., max_occurrences=1, prefer_last=True)`. The
+utility's default is still to remove every eligible occurrence, so nothing else that uses it changed
+behaviour.
+
 ### The HITL routing decision
 
 `HitlDecision` sits with the rest of the business policy in `scoring.py`, not scattered through the
@@ -382,6 +407,37 @@ path — a manual override is the documented, intentional exception, and Phase 1
 
 A null-skipped group gets a blank state rather than `AUTO_ACCEPT_CANDIDATE`: it was never evaluated,
 so asserting it is a candidate would claim a judgement nobody made.
+
+### Threshold analytics and reporting consistency
+
+Reporting never re-implements the routing rule. `reporting.forced_review_mask()` is the single
+definition of "stays with a human whatever the threshold is", and the sensitivity table, the KPI
+table, the executive summary and every threshold curve consume it. Without that shared definition a
+hypothetical-threshold sweep drifts: a reference-conflicted case with a score of 0.91 would be
+reported as an auto-accept the moment the swept threshold dropped below 0.91, which is not what the
+pipeline would do. The mask reads `hitl_forced_review` — written by `determine_hitl_decision` — and
+ORs in the individual signals so a frame assembled without that column still reports the override.
+This is a reporting-consistency measure only; the HITL engine in `scoring.py` is untouched.
+
+Four analyses sit on top, each answering a different question:
+
+| Builder | Question | Population |
+|---|---|---|
+| `build_threshold_tradeoff` | how does review workload respond to the cutoff? | every non-empty instance |
+| `build_precision_coverage` | how good is what we would auto-accept, and how much does it cover? | fully grounded observations |
+| `build_error_capture_gain` | reviewing lowest-score-first, how fast are real errors reached? | fully grounded, ≥1 labelled error |
+| `build_error_capture_lift` | how many times better than random is that? | as above |
+
+The three label-dependent analyses return an `AnalysisResult` whose `available` flag is a first-class
+outcome: with too few labels the honest answer is a stated reason, not a chart the data cannot
+support, so no CSV and no PNG are written. Filenames, the grid step and the minimum label counts are
+`config.reporting` values.
+
+**None of these change routing.** `scoring.hitl_threshold` is configuration. The trade-off curve is
+workload analysis and its shape is not evidence about correctness, so an elbow in it does not select
+a threshold. A production cutoff is the lowest threshold meeting the business-approved minimum
+precision for the auto-accepted population at an operationally acceptable review volume — a
+precision/coverage argument plus a risk decision.
 
 ## 9b. Output surfaces
 
