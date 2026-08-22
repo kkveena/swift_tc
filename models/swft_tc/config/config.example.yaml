@@ -103,6 +103,12 @@ reporting:
   score_band_edges: [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
   sensitivity_thresholds: [0.80, 0.85, 0.90, 0.95]
   recommended_threshold: 0.90
+  # Threshold analytics. Artifact filenames keep their defaults here; only the
+  # values worth tuning are shown. These are decision-support outputs and never
+  # change scoring.hitl_threshold below.
+  threshold_curve_step: 0.01            # must satisfy 0 < step <= 1
+  min_grounded_for_precision: 1
+  min_errors_for_gain: 1
 
 scoring:
   mode: "composite_weighted"

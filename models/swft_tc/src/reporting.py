@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -33,9 +33,12 @@ import pandas as pd
 
 __all__ = [
     "BELOW_FIRST_BAND_LABEL",
+    "AnalysisResult",
     "ExecutiveReport",
     "OPERATOR_METADATA_KEYS",
+    "auto_accept_mask",
     "data_derived_strings",
+    "forced_review_mask",
     "band_labels",
     "build_cross_entropy_summary",
     "build_executive_summary",
@@ -43,9 +46,18 @@ __all__ = [
     "build_kpi_table",
     "build_scenario_distribution",
     "build_score_distribution",
+    "build_error_capture_gain",
+    "build_error_capture_lift",
+    "build_precision_coverage",
     "build_threshold_sensitivity",
+    "build_threshold_tradeoff",
     "classify_score",
+    "threshold_grid",
+    "render_error_capture_gain_chart",
+    "render_error_capture_lift_chart",
+    "render_precision_coverage_chart",
     "render_score_histogram",
+    "render_threshold_tradeoff_chart",
     "write_reports",
 ]
 
@@ -131,6 +143,60 @@ def classify_score(score: float, edges: Sequence[float]) -> str:
     return labels[-1]  # pragma: no cover - unreachable, the last band is open-topped
 
 
+def forced_review_mask(instances: pd.DataFrame) -> pd.Series:
+    """Which observations stay with a human **whatever the threshold is**.
+
+    The Composite Weighted Score is not the only control. Review is also
+    required by a processing error, a manual override, unresolved final country
+    ambiguity, or a reference conflict — and none of those care what number the
+    cutoff is set to. A hypothetical-threshold sweep that ignores them reports a
+    reference-conflicted case as an auto-accept the moment the threshold drops
+    below its score, which is not what the pipeline would actually do.
+
+    This is the single definition every reporting path uses — the sensitivity
+    table, the KPI table, the executive summary and the threshold curves — so
+    they can never drift apart or implement three partial versions of the rule.
+    It is *reporting* only: :func:`models.swft_tc.src.scoring.determine_hitl_decision`
+    remains the sole authority on the real routing decision, and nothing here
+    changes it.
+
+    ``hitl_forced_review`` — written by that engine — is the authority when the
+    frame carries it. The individual signals are OR-ed in as well so a frame
+    assembled without it (an older artifact, a hand-built test fixture) still
+    reports the override rather than silently losing it. Erring toward "forced"
+    is the safe direction: it never turns a review case into an auto-accept.
+    """
+    frame = _non_empty(instances)
+    if frame.empty:
+        return pd.Series(dtype=bool)
+
+    forced = pd.Series(False, index=frame.index)
+    if "hitl_forced_review" in frame.columns:
+        forced = forced | frame["hitl_forced_review"].fillna(False).astype(bool)
+    for column in ("country_ambiguous", "extraction_error", "manual_override"):
+        if column in frame.columns:
+            forced = forced | frame[column].fillna(False).astype(bool)
+    if "reference_status" in frame.columns:
+        from .scoring import REFERENCE_CONFLICT
+
+        forced = forced | frame["reference_status"].eq(REFERENCE_CONFLICT)
+    return forced
+
+
+def auto_accept_mask(instances: pd.DataFrame, threshold: float) -> pd.Series:
+    """Observations that would be auto-accept *candidates* at ``threshold``.
+
+    A candidate is an observation that both clears the cutoff and carries no
+    forced-review control. Candidate, not accepted — the name is the reminder
+    that a human policy still decides what happens to them.
+    """
+    frame = _non_empty(instances)
+    if frame.empty:
+        return pd.Series(dtype=bool)
+    meets = frame["composite_weighted_score"].astype(float) >= float(threshold)
+    return meets & ~forced_review_mask(frame)
+
+
 def _non_empty(instances: pd.DataFrame) -> pd.DataFrame:
     """`RunResult.instances` already contains only non-empty instances."""
     if instances is None or instances.empty:
@@ -206,13 +272,17 @@ def build_threshold_sensitivity(
     """How routing volume responds to the HITL threshold.
 
     A score at or above the threshold is an auto-accept *candidate* — candidate,
-    not accepted, because unresolved country ambiguity, an extraction failure,
-    and a model/reference conflict force review whatever the number says. Those
-    forced cases are reported in their own columns so the override is visible
-    rather than implied.
+    not accepted, because a processing error, a manual override, unresolved
+    country ambiguity, and a model/reference conflict force review whatever the
+    number says. :func:`forced_review_mask` is the single definition of that
+    override, shared with the KPI table, the executive summary and the threshold
+    curves. Forced cases are also reported in their own columns so the override
+    is visible rather than implied.
     """
     frame = _non_empty(instances)
     total = len(frame)
+    forced = forced_review_mask(frame)
+    forced_count = int(forced.sum()) if total else 0
 
     rows: list[dict[str, Any]] = []
     for threshold in thresholds:
@@ -224,14 +294,15 @@ def build_threshold_sensitivity(
                     "auto_accept_candidate_percent": 0.0,
                     "hitl_count": 0,
                     "hitl_percent": 0.0,
+                    "forced_review_count": 0,
+                    "low_score_hitl_count": 0,
                     "ambiguous_forced_hitl_count": 0,
                     "error_forced_hitl_count": 0,
                 }
             )
             continue
 
-        forced = frame["country_ambiguous"] | frame["extraction_error"]
-        meets = frame["composite_weighted_score"] >= float(threshold)
+        meets = frame["composite_weighted_score"].astype(float) >= float(threshold)
         auto_accept = meets & ~forced
 
         auto_count = int(auto_accept.sum())
@@ -243,6 +314,10 @@ def build_threshold_sensitivity(
                 "auto_accept_candidate_percent": _percent(auto_count, total),
                 "hitl_count": hitl_count,
                 "hitl_percent": _percent(hitl_count, total),
+                # Forced cases are threshold-invariant; the low-score column is
+                # the part of the workload the cutoff actually moves.
+                "forced_review_count": forced_count,
+                "low_score_hitl_count": int((~meets & ~forced).sum()),
                 "ambiguous_forced_hitl_count": int(frame["country_ambiguous"].sum()),
                 "error_forced_hitl_count": int(frame["extraction_error"].sum()),
             }
@@ -389,17 +464,9 @@ def build_kpi_table(
     """Compact executive KPI table with explicit denominators."""
     frame = _non_empty(instances)
     total_instances = len(frame)
-    forced = (
-        (frame["country_ambiguous"] | frame["extraction_error"])
-        if total_instances
-        else pd.Series(dtype=bool)
-    )
-    auto = (
-        ((frame["composite_weighted_score"] >= float(threshold)) & ~forced).sum()
-        if total_instances
-        else 0
-    )
-    hitl = total_instances - int(auto)
+    auto = int(auto_accept_mask(frame, threshold).sum()) if total_instances else 0
+    forced_count = int(forced_review_mask(frame).sum()) if total_instances else 0
+    hitl = total_instances - auto
 
     shape = metrics.get("shape", {})
     pass1 = metrics.get("pass1", {})
@@ -420,6 +487,8 @@ def build_kpi_table(
         ("Reference conflicts", outcomes.get("reference_conflict_instances", 0), "instances"),
         ("HITL instances", hitl, "instances"),
         ("HITL %", _percent(hitl, total_instances), "% of non-empty instances"),
+        ("  forced by a control, whatever the threshold", forced_count, "instances"),
+        ("  below threshold only", hitl - forced_count, "instances"),
         ("Auto-accept candidates", int(auto), "instances"),
         ("Auto-accept candidate %", _percent(int(auto), total_instances), "% of non-empty instances"),
         ("Configured HITL threshold", round(float(threshold), 4), "composite score"),
@@ -444,16 +513,8 @@ def build_executive_summary(
     """The JSON executive artifact. Carries no raw address, by construction."""
     frame = _non_empty(instances)
     total_instances = len(frame)
-    forced = (
-        (frame["country_ambiguous"] | frame["extraction_error"])
-        if total_instances
-        else pd.Series(dtype=bool)
-    )
-    auto = (
-        int(((frame["composite_weighted_score"] >= float(threshold)) & ~forced).sum())
-        if total_instances
-        else 0
-    )
+    auto = int(auto_accept_mask(frame, threshold).sum()) if total_instances else 0
+    forced_count = int(forced_review_mask(frame).sum()) if total_instances else 0
     hitl = total_instances - auto
 
     run = metrics.get("run", {})
@@ -485,6 +546,8 @@ def build_executive_summary(
         "auto_accept_candidate_percent": _percent(auto, total_instances),
         "hitl_instances": hitl,
         "hitl_percent": _percent(hitl, total_instances),
+        "forced_review_instances": forced_count,
+        "low_score_only_hitl_instances": hitl - forced_count,
         "ambiguous_country_instances": metrics.get("outcomes", {}).get(
             "ambiguous_country_instances", 0
         ),
@@ -497,6 +560,342 @@ def build_executive_summary(
             "against labeled validation data before production use."
         ),
     }
+
+
+# --------------------------------------------------------------------------
+# Threshold analytics
+#
+# Three different questions, deliberately kept apart because they answer
+# different things and only one of them is about model quality:
+#
+#   threshold trade-off   how much review work does a cutoff create?
+#   precision / coverage  how good is what we would auto-accept, and how much
+#                         of the labelled population does that cover?
+#   error-capture gain    if reviewers work lowest-score-first, how quickly do
+#                         they reach the cases that are actually wrong?
+#
+# All three are decision *support*. None of them sets `scoring.hitl_threshold`;
+# that stays configuration, approved separately against business risk appetite.
+# --------------------------------------------------------------------------
+
+
+def threshold_grid(step: float) -> tuple[float, ...]:
+    """Evaluation points from 0.00 to 1.00 inclusive at ``step``.
+
+    Values are rounded to the precision the step implies, so a 0.01 grid gives
+    exactly 0.00, 0.01, … 1.00 rather than binary-float noise that would make
+    the CSV impossible to diff.
+    """
+    if not 0.0 < step <= 1.0:
+        raise ValueError(f"threshold step {step} must lie in (0, 1]")
+    digits = max(0, len(f"{step:.10f}".rstrip("0").split(".")[1]))
+    count = int(round(1.0 / step))
+    grid = [round(min(1.0, index * step), digits) for index in range(count + 1)]
+    if grid[-1] != 1.0:
+        grid.append(1.0)
+    return tuple(dict.fromkeys(grid))
+
+
+def build_threshold_tradeoff(
+    instances: pd.DataFrame, *, step: float = 0.01
+) -> pd.DataFrame:
+    """Auto-accept vs review workload across a fine threshold grid.
+
+    This is the operational workload curve: at each candidate cutoff, how much
+    of the non-empty population would be an auto-accept candidate and how much
+    would reach a human. It says nothing about whether those auto-accepts are
+    *correct* — that is what :func:`build_precision_coverage` is for.
+
+    Forced-review cases are held out of the auto-accept side at every threshold
+    via :func:`forced_review_mask`, so lowering the cutoff can never turn a
+    reference-conflicted or ambiguous case into a candidate. ``forced_review_count``
+    is therefore flat down the table by construction, and ``low_score_hitl_count``
+    is the only part the cutoff actually moves.
+    """
+    frame = _non_empty(instances)
+    total = len(frame)
+    grid = threshold_grid(step)
+
+    if total == 0:
+        return pd.DataFrame(
+            [
+                {
+                    "threshold": threshold,
+                    "auto_accept_candidate_count": 0,
+                    "auto_accept_candidate_percent": 0.0,
+                    "hitl_count": 0,
+                    "hitl_percent": 0.0,
+                    "forced_review_count": 0,
+                    "low_score_hitl_count": 0,
+                }
+                for threshold in grid
+            ]
+        )
+
+    forced = forced_review_mask(frame)
+    forced_count = int(forced.sum())
+    scores = frame["composite_weighted_score"].astype(float)
+
+    rows: list[dict[str, Any]] = []
+    for threshold in grid:
+        meets = scores >= threshold
+        auto_count = int((meets & ~forced).sum())
+        hitl_count = total - auto_count
+        rows.append(
+            {
+                "threshold": threshold,
+                "auto_accept_candidate_count": auto_count,
+                "auto_accept_candidate_percent": _percent(auto_count, total),
+                "hitl_count": hitl_count,
+                "hitl_percent": _percent(hitl_count, total),
+                "forced_review_count": forced_count,
+                "low_score_hitl_count": int((~meets & ~forced).sum()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _fully_grounded(instances: pd.DataFrame) -> pd.DataFrame:
+    """Observations carrying independent ground truth for **both** Town and Country.
+
+    Precision and error capture are only meaningful where both halves of the
+    prediction can be checked. A partially grounded observation is excluded
+    rather than assumed correct or incorrect — a coverage gap is not evidence.
+    """
+    frame = _non_empty(instances)
+    required = {"town_grounded", "country_grounded", "town_exists_ok", "country_exists_ok"}
+    if frame.empty or not required.issubset(frame.columns):
+        return frame.iloc[0:0]
+    grounded = frame["town_grounded"].fillna(False).astype(bool) & frame[
+        "country_grounded"
+    ].fillna(False).astype(bool)
+    return frame.loc[grounded]
+
+
+def _group_correct(frame: pd.DataFrame) -> pd.Series:
+    """A fully grounded observation is correct only if both halves are correct."""
+    if frame.empty:
+        return pd.Series(dtype=bool)
+    return frame["town_exists_ok"].fillna(False).astype(bool) & frame[
+        "country_exists_ok"
+    ].fillna(False).astype(bool)
+
+
+@dataclass(frozen=True)
+class AnalysisResult:
+    """One threshold-analytics artifact plus whether it could be produced.
+
+    ``available`` False is a first-class outcome, not a failure: with too few
+    labelled observations the honest answer is to say so rather than draw a
+    chart the data cannot support. ``reason`` carries that sentence for the
+    report and the notebook to print verbatim.
+    """
+
+    available: bool
+    reason: str
+    table: pd.DataFrame = field(default_factory=pd.DataFrame)
+    summary: dict[str, Any] = field(default_factory=dict)
+
+
+def build_precision_coverage(
+    instances: pd.DataFrame,
+    *,
+    step: float = 0.01,
+    min_grounded: int = 1,
+) -> AnalysisResult:
+    """Auto-accept precision against grounded coverage, across the threshold grid.
+
+    Restricted to *fully grounded* observations — both Town and Country
+    independently labelled — because precision over a population you cannot
+    check is not precision. Ungrounded observations are excluded from both the
+    numerator and the denominator.
+
+    ``auto_accept_precision`` is the share of grounded auto-accept candidates
+    that are actually correct; ``grounded_coverage`` is the share of the fully
+    grounded population those candidates represent. Raising the threshold
+    normally trades coverage away for precision, and this is the curve a
+    production cutoff should be argued from — not the workload curve.
+
+    Forced-review cases can never be auto-accept candidates here either.
+    """
+    grounded = _fully_grounded(instances)
+    total_grounded = len(grounded)
+    if total_grounded < max(1, min_grounded):
+        return AnalysisResult(
+            available=False,
+            reason=(
+                "Precision/Coverage analysis not generated: insufficient fully "
+                f"grounded observations ({total_grounded} available, "
+                f"{max(1, min_grounded)} required). Both Town and Country must "
+                "carry independent ground truth for an observation to count."
+            ),
+            summary={"fully_grounded_observations": total_grounded},
+        )
+
+    forced = forced_review_mask(grounded)
+    scores = grounded["composite_weighted_score"].astype(float)
+    correct = _group_correct(grounded)
+
+    rows: list[dict[str, Any]] = []
+    for threshold in threshold_grid(step):
+        auto = (scores >= threshold) & ~forced
+        auto_count = int(auto.sum())
+        correct_count = int((auto & correct).sum())
+        rows.append(
+            {
+                "threshold": threshold,
+                "grounded_auto_accept_count": auto_count,
+                "grounded_correct_auto_accept_count": correct_count,
+                "auto_accept_precision": (
+                    round(100.0 * correct_count / auto_count, 2) if auto_count else None
+                ),
+                "grounded_coverage": _percent(auto_count, total_grounded),
+                "grounded_hitl_count": total_grounded - auto_count,
+            }
+        )
+
+    table = pd.DataFrame(rows)
+    return AnalysisResult(
+        available=True,
+        reason="",
+        table=table,
+        summary={
+            "fully_grounded_observations": total_grounded,
+            "fully_grounded_correct": int(correct.sum()),
+            "fully_grounded_errors": int((~correct).sum()),
+            "forced_review_grounded": int(forced.sum()),
+        },
+    )
+
+
+def build_error_capture_gain(
+    instances: pd.DataFrame, *, min_errors: int = 1
+) -> AnalysisResult:
+    """Cumulative share of real errors captured as review depth increases.
+
+    The business question is not "how accurate is the model" but "if a reviewer
+    works the lowest-confidence cases first, how quickly do they reach the ones
+    that are actually wrong?" Fully grounded observations are sorted by
+    Composite Weighted Score ascending — review order — and the curve reports,
+    for each depth, what fraction of the known errors has been seen.
+
+    A diagonal is what random review would achieve; anything above it is the
+    value the ranking adds. With no labelled errors there is no curve to draw
+    and none is invented.
+    """
+    grounded = _fully_grounded(instances)
+    total_grounded = len(grounded)
+    if total_grounded == 0:
+        return AnalysisResult(
+            available=False,
+            reason=(
+                "Gain/Lift not available because the labelled population "
+                "contains insufficient grounded errors: no fully grounded "
+                "observations (both Town and Country labelled) exist."
+            ),
+            summary={"fully_grounded_observations": 0, "grounded_errors": 0},
+        )
+
+    is_error = ~_group_correct(grounded)
+    total_errors = int(is_error.sum())
+    if total_errors < max(1, min_errors):
+        return AnalysisResult(
+            available=False,
+            reason=(
+                "Gain/Lift not available because the labelled population "
+                f"contains insufficient grounded errors ({total_errors} in "
+                f"{total_grounded} fully grounded observations, "
+                f"{max(1, min_errors)} required)."
+            ),
+            summary={
+                "fully_grounded_observations": total_grounded,
+                "grounded_errors": total_errors,
+            },
+        )
+
+    # Ascending score = review order. record_id/group_id break ties so the same
+    # run always produces the same curve.
+    order = grounded.assign(_is_error=is_error).sort_values(
+        by=["composite_weighted_score", "record_id", "group_id"],
+        kind="mergesort",
+    )
+    captured = 0
+    rows: list[dict[str, Any]] = [
+        {
+            "reviewed_population_count": 0,
+            "reviewed_population_percent": 0.0,
+            "errors_captured_count": 0,
+            "errors_captured_percent": 0.0,
+            "random_baseline_percent": 0.0,
+            "composite_weighted_score": None,
+        }
+    ]
+    for position, (_, row) in enumerate(order.iterrows(), start=1):
+        captured += int(bool(row["_is_error"]))
+        reviewed_percent = _percent(position, total_grounded)
+        rows.append(
+            {
+                "reviewed_population_count": position,
+                "reviewed_population_percent": reviewed_percent,
+                "errors_captured_count": captured,
+                "errors_captured_percent": _percent(captured, total_errors),
+                # Random review captures errors at the population rate.
+                "random_baseline_percent": reviewed_percent,
+                "composite_weighted_score": round(
+                    float(row["composite_weighted_score"]), 6
+                ),
+            }
+        )
+
+    return AnalysisResult(
+        available=True,
+        reason="",
+        table=pd.DataFrame(rows),
+        summary={
+            "fully_grounded_observations": total_grounded,
+            "grounded_errors": total_errors,
+            "grounded_error_rate_percent": _percent(total_errors, total_grounded),
+        },
+    )
+
+
+def build_error_capture_lift(gain: AnalysisResult) -> AnalysisResult:
+    """How many times better than random the review ranking is, at each depth.
+
+    ``lift = errors_captured_percent / reviewed_population_percent``. Reviewing
+    20% of the population and finding 60% of the errors is a lift of 3.0 — the
+    ranking reaches errors three times faster than random review would. The
+    0%-reviewed row has no defined lift and is dropped rather than reported as
+    zero.
+    """
+    if not gain.available:
+        return AnalysisResult(
+            available=False, reason=gain.reason, summary=dict(gain.summary)
+        )
+
+    table = gain.table.loc[gain.table["reviewed_population_percent"] > 0].copy()
+    if table.empty:  # pragma: no cover - defensive
+        return AnalysisResult(
+            available=False,
+            reason="Gain/Lift not available: no reviewed population to divide by.",
+            summary=dict(gain.summary),
+        )
+
+    table["lift"] = (
+        table["errors_captured_percent"] / table["reviewed_population_percent"]
+    ).round(4)
+    columns = [
+        "reviewed_population_count",
+        "reviewed_population_percent",
+        "errors_captured_count",
+        "errors_captured_percent",
+        "lift",
+    ]
+    table = table[columns].reset_index(drop=True)
+
+    summary = dict(gain.summary)
+    summary["max_lift"] = float(table["lift"].max())
+    return AnalysisResult(available=True, reason="", table=table, summary=summary)
 
 
 def render_score_histogram(
@@ -596,6 +995,245 @@ def render_score_histogram(
     return output
 
 
+def _new_axes(figsize=(10, 5.4)):
+    """A configured figure/axes pair sharing the report chart styling."""
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless: no display needed, and none available
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(figsize=figsize, dpi=150)
+    figure.patch.set_facecolor(_SURFACE)
+    axes.set_facecolor(_SURFACE)
+    axes.grid(color=_GRID, linewidth=0.8, zorder=0)
+    axes.set_axisbelow(True)
+    for spine in ("top", "right"):
+        axes.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        axes.spines[spine].set_color(_GRID)
+    axes.tick_params(colors=_INK_SECONDARY, length=0, labelsize=8.5)
+    return figure, axes
+
+
+def _finish(figure, axes, path: str | Path, *, legend_columns: int = 2) -> Path:
+    """Legend below the plot, tight bounds, close the figure, return the path."""
+    import matplotlib.pyplot as plt
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    handles, labels = axes.get_legend_handles_labels()
+    if handles:
+        axes.legend(
+            loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=legend_columns,
+            frameon=False, fontsize=8.5, labelcolor=_INK_SECONDARY,
+        )
+    figure.tight_layout()
+    figure.savefig(output, facecolor=_SURFACE, bbox_inches="tight")
+    plt.close(figure)
+    return output
+
+
+def _mark_threshold(axes, value: float, label: str, *, color: str, style: str) -> None:
+    axes.axvline(
+        float(value), color=color, linestyle=style, linewidth=1.4, zorder=2,
+        label=f"{label} ({float(value):.2f})",
+    )
+
+
+def render_threshold_tradeoff_chart(
+    tradeoff: pd.DataFrame,
+    path: str | Path,
+    *,
+    configured_threshold: float,
+    recommended_threshold: float,
+    total_non_empty: int,
+    title: str = "Threshold Trade-off: Auto-Accept Candidate vs HITL Workload",
+) -> Path:
+    """Render the cutoff / workload trade-off curve.
+
+    Deliberately *not* labelled with an "optimal" point. The curve shows how
+    review workload responds to the cutoff; it says nothing about whether the
+    auto-accepted population is correct, so an elbow in it is not evidence for a
+    production threshold. Both the configured operational threshold and the
+    analytical recommendation are drawn from configuration as reference markers,
+    never derived from the shape of the curve.
+    """
+    figure, axes = _new_axes()
+
+    thresholds = tradeoff["threshold"].astype(float).tolist()
+    axes.plot(
+        thresholds, tradeoff["auto_accept_candidate_percent"].astype(float),
+        color=_COLOR_AUTO, linewidth=2.2, zorder=3,
+        label="Auto-accept candidate %",
+    )
+    axes.plot(
+        thresholds, tradeoff["hitl_percent"].astype(float),
+        color=_COLOR_HITL, linewidth=2.2, linestyle=(0, (5, 2)), zorder=3,
+        label="HITL %",
+    )
+    _mark_threshold(
+        axes, configured_threshold, "Configured operational threshold",
+        color=_INK_PRIMARY, style=(0, (2, 2)),
+    )
+    _mark_threshold(
+        axes, recommended_threshold, "Analytical recommendation",
+        color=_INK_SECONDARY, style=(0, (1, 2)),
+    )
+
+    axes.set_title(title, color=_INK_PRIMARY, fontsize=13, pad=14, loc="left")
+    axes.set_xlabel(
+        "Composite Weighted Score threshold", color=_INK_SECONDARY,
+        fontsize=9.5, labelpad=10,
+    )
+    axes.set_ylabel(
+        f"% of non-empty address-group instances  (n = {total_non_empty})",
+        color=_INK_SECONDARY, fontsize=9.5,
+    )
+    axes.set_xlim(0.0, 1.0)
+    axes.set_ylim(-2, 102)
+    output = _finish(figure, axes, path)
+    logger.info("wrote threshold trade-off chart to %s", output)
+    return output
+
+
+def render_precision_coverage_chart(
+    precision_coverage: pd.DataFrame,
+    path: str | Path,
+    *,
+    configured_threshold: float,
+    recommended_threshold: float,
+    total_grounded: int,
+    title: str = "Auto-Accept Precision vs Grounded Coverage",
+) -> Path:
+    """Render precision against coverage over fully grounded observations.
+
+    This is the curve a production cutoff should be argued from: it shows what
+    is given up in automation to gain quality. The configured and recommended
+    thresholds are marked as points on the curve so their cost is visible.
+    """
+    figure, axes = _new_axes(figsize=(9, 5.6))
+
+    usable = precision_coverage.dropna(subset=["auto_accept_precision"])
+    axes.plot(
+        usable["grounded_coverage"].astype(float),
+        usable["auto_accept_precision"].astype(float),
+        color=_COLOR_AUTO, linewidth=2.2, marker="o", markersize=3, zorder=3,
+        label="Precision at a given coverage",
+    )
+
+    for threshold, label, color in (
+        (configured_threshold, "Configured operational threshold", _INK_PRIMARY),
+        (recommended_threshold, "Analytical recommendation", _COLOR_HITL),
+    ):
+        point = _nearest_threshold_row(precision_coverage, threshold)
+        if point is None:
+            continue
+        axes.scatter(
+            [float(point["grounded_coverage"])], [float(point["auto_accept_precision"])],
+            s=90, color=color, zorder=5, marker="D",
+            label=f"{label} ({float(threshold):.2f})",
+        )
+
+    axes.set_title(title, color=_INK_PRIMARY, fontsize=13, pad=14, loc="left")
+    axes.set_xlabel(
+        f"Grounded coverage %  (n = {total_grounded} fully grounded observations)",
+        color=_INK_SECONDARY, fontsize=9.5, labelpad=10,
+    )
+    axes.set_ylabel("Auto-accept precision %", color=_INK_SECONDARY, fontsize=9.5)
+    axes.set_xlim(-2, 102)
+    axes.set_ylim(-2, 102)
+    output = _finish(figure, axes, path, legend_columns=1)
+    logger.info("wrote precision/coverage chart to %s", output)
+    return output
+
+
+def _nearest_threshold_row(table: pd.DataFrame, threshold: float):
+    """The grid row closest to ``threshold`` that has a defined precision."""
+    usable = table.dropna(subset=["auto_accept_precision"])
+    if usable.empty:
+        return None
+    distances = (usable["threshold"].astype(float) - float(threshold)).abs()
+    return usable.loc[distances.idxmin()]
+
+
+def render_error_capture_gain_chart(
+    gain: pd.DataFrame,
+    path: str | Path,
+    *,
+    total_grounded: int,
+    total_errors: int,
+    title: str = "Error-Capture Gain: Low-Score-First HITL Review",
+) -> Path:
+    """Render the cumulative error-capture curve against the random baseline.
+
+    The diagonal is what reviewing a random sample of the same size would
+    achieve. Distance above it is the value the score ranking adds to review
+    prioritisation — not a statement about overall model accuracy.
+    """
+    figure, axes = _new_axes()
+
+    reviewed = gain["reviewed_population_percent"].astype(float)
+    axes.plot(
+        reviewed, gain["errors_captured_percent"].astype(float),
+        color=_COLOR_AUTO, linewidth=2.2, marker="o", markersize=3, zorder=3,
+        label="Errors captured by lowest-score-first review",
+    )
+    axes.plot(
+        [0, 100], [0, 100],
+        color=_INK_SECONDARY, linewidth=1.4, linestyle=(0, (4, 3)), zorder=2,
+        label="Random review baseline",
+    )
+
+    axes.set_title(title, color=_INK_PRIMARY, fontsize=13, pad=14, loc="left")
+    axes.set_xlabel(
+        f"% of fully grounded population sent to review  (n = {total_grounded})",
+        color=_INK_SECONDARY, fontsize=9.5, labelpad=10,
+    )
+    axes.set_ylabel(
+        f"% of actual errors captured  (n = {total_errors})",
+        color=_INK_SECONDARY, fontsize=9.5,
+    )
+    axes.set_xlim(-2, 102)
+    axes.set_ylim(-2, 102)
+    output = _finish(figure, axes, path)
+    logger.info("wrote error-capture gain chart to %s", output)
+    return output
+
+
+def render_error_capture_lift_chart(
+    lift: pd.DataFrame,
+    path: str | Path,
+    *,
+    total_grounded: int,
+    title: str = "Error-Capture Lift vs Random Review",
+) -> Path:
+    """Render lift against review depth, with the random-review line at 1.0."""
+    figure, axes = _new_axes()
+
+    axes.plot(
+        lift["reviewed_population_percent"].astype(float),
+        lift["lift"].astype(float),
+        color=_COLOR_AUTO, linewidth=2.2, marker="o", markersize=3, zorder=3,
+        label="Lift over random review",
+    )
+    axes.axhline(
+        1.0, color=_INK_SECONDARY, linewidth=1.4, linestyle=(0, (4, 3)), zorder=2,
+        label="Random review (lift = 1.0)",
+    )
+
+    axes.set_title(title, color=_INK_PRIMARY, fontsize=13, pad=14, loc="left")
+    axes.set_xlabel(
+        f"% of fully grounded population sent to review  (n = {total_grounded})",
+        color=_INK_SECONDARY, fontsize=9.5, labelpad=10,
+    )
+    axes.set_ylabel("Lift (x random)", color=_INK_SECONDARY, fontsize=9.5)
+    axes.set_xlim(-2, 102)
+    axes.set_ylim(bottom=0)
+    output = _finish(figure, axes, path)
+    logger.info("wrote error-capture lift chart to %s", output)
+    return output
+
+
 @dataclass(frozen=True)
 class ExecutiveReport:
     """Every report artifact, in memory and on disk."""
@@ -608,6 +1246,32 @@ class ExecutiveReport:
     hitl_state_distribution: pd.DataFrame
     executive_summary: dict[str, Any]
     paths: dict[str, Path]
+    #: Threshold analytics. The trade-off curve is always produced; the three
+    #: label-dependent analyses carry their own availability and, when
+    #: unavailable, the sentence explaining why.
+    threshold_tradeoff: pd.DataFrame = field(default_factory=pd.DataFrame)
+    precision_coverage: AnalysisResult = field(
+        default_factory=lambda: AnalysisResult(available=False, reason="not computed")
+    )
+    error_capture_gain: AnalysisResult = field(
+        default_factory=lambda: AnalysisResult(available=False, reason="not computed")
+    )
+    error_capture_lift: AnalysisResult = field(
+        default_factory=lambda: AnalysisResult(available=False, reason="not computed")
+    )
+
+    @property
+    def unavailable_analyses(self) -> dict[str, str]:
+        """Analyses the labelled data could not support, and the reason for each."""
+        return {
+            name: result.reason
+            for name, result in (
+                ("precision_coverage", self.precision_coverage),
+                ("error_capture_gain", self.error_capture_gain),
+                ("error_capture_lift", self.error_capture_lift),
+            )
+            if not result.available
+        }
 
 
 def write_reports(
@@ -638,6 +1302,27 @@ def write_reports(
     hitl_states = build_hitl_state_distribution(instances)
     summary = build_executive_summary(metrics, instances, threshold=effective_threshold)
 
+    # Threshold analytics. Each is decision support only; none of them changes
+    # `scoring.hitl_threshold`, which stays configuration.
+    step = float(getattr(reporting, "threshold_curve_step", 0.01))
+    tradeoff = build_threshold_tradeoff(instances, step=step)
+    precision_coverage = build_precision_coverage(
+        instances,
+        step=step,
+        min_grounded=int(getattr(reporting, "min_grounded_for_precision", 1)),
+    )
+    gain = build_error_capture_gain(
+        instances, min_errors=int(getattr(reporting, "min_errors_for_gain", 1))
+    )
+    lift = build_error_capture_lift(gain)
+    for name, result in (
+        ("precision/coverage", precision_coverage),
+        ("error-capture gain", gain),
+        ("error-capture lift", lift),
+    ):
+        if not result.available:
+            logger.info("%s analysis skipped: %s", name, result.reason)
+
     reports_dir = config.path(reporting.reports_dir)
     charts_dir = config.path(reporting.charts_dir)
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -658,6 +1343,23 @@ def write_reports(
     paths["hitl_state_distribution"] = _write_csv(
         hitl_states, reports_dir / reporting.hitl_state_distribution_filename
     )
+    paths["threshold_tradeoff"] = _write_csv(
+        tradeoff, reports_dir / reporting.threshold_tradeoff_filename
+    )
+    # A table is written only when the labels support it. A CSV of nothing would
+    # read as "the analysis ran and found nothing", which is a different claim.
+    if precision_coverage.available:
+        paths["precision_coverage"] = _write_csv(
+            precision_coverage.table, reports_dir / reporting.precision_coverage_filename
+        )
+    if gain.available:
+        paths["error_capture_gain"] = _write_csv(
+            gain.table, reports_dir / reporting.error_capture_gain_filename
+        )
+    if lift.available:
+        paths["error_capture_lift"] = _write_csv(
+            lift.table, reports_dir / reporting.error_capture_lift_filename
+        )
 
     summary_path = reports_dir / reporting.executive_summary_filename
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -668,12 +1370,46 @@ def write_reports(
 
     if write_chart:
         charts_dir.mkdir(parents=True, exist_ok=True)
+        total_non_empty = len(_non_empty(instances))
+        recommended = float(
+            getattr(reporting, "recommended_threshold", effective_threshold)
+        )
         paths["histogram"] = render_score_histogram(
             distribution,
             charts_dir / reporting.histogram_filename,
             threshold=effective_threshold,
-            total_non_empty=len(_non_empty(instances)),
+            total_non_empty=total_non_empty,
         )
+        paths["threshold_tradeoff_chart"] = render_threshold_tradeoff_chart(
+            tradeoff,
+            charts_dir / reporting.threshold_tradeoff_chart_filename,
+            configured_threshold=effective_threshold,
+            recommended_threshold=recommended,
+            total_non_empty=total_non_empty,
+        )
+        if precision_coverage.available:
+            paths["precision_coverage_chart"] = render_precision_coverage_chart(
+                precision_coverage.table,
+                charts_dir / reporting.precision_coverage_chart_filename,
+                configured_threshold=effective_threshold,
+                recommended_threshold=recommended,
+                total_grounded=int(
+                    precision_coverage.summary.get("fully_grounded_observations", 0)
+                ),
+            )
+        if gain.available:
+            paths["error_capture_gain_chart"] = render_error_capture_gain_chart(
+                gain.table,
+                charts_dir / reporting.error_capture_gain_chart_filename,
+                total_grounded=int(gain.summary.get("fully_grounded_observations", 0)),
+                total_errors=int(gain.summary.get("grounded_errors", 0)),
+            )
+        if lift.available:
+            paths["error_capture_lift_chart"] = render_error_capture_lift_chart(
+                lift.table,
+                charts_dir / reporting.error_capture_lift_chart_filename,
+                total_grounded=int(lift.summary.get("fully_grounded_observations", 0)),
+            )
 
     return ExecutiveReport(
         kpis=kpis,
@@ -684,6 +1420,10 @@ def write_reports(
         hitl_state_distribution=hitl_states,
         executive_summary=summary,
         paths=paths,
+        threshold_tradeoff=tradeoff,
+        precision_coverage=precision_coverage,
+        error_capture_gain=gain,
+        error_capture_lift=lift,
     )
 
 

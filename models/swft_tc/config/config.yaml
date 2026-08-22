@@ -189,6 +189,37 @@ reporting:
   # Distribution of the primary HITL routing state over non-empty instances.
   hitl_state_distribution_filename: "hitl_state_distribution.csv"
   histogram_filename: "composite_score_histogram.png"
+
+  # --- Threshold analytics (decision support only) -------------------------
+  # These artifacts inform a threshold conversation; they never set one. The
+  # operational cutoff is `scoring.hitl_threshold` below and is changed only by
+  # an approved configuration change, never by the shape of a curve.
+  #
+  # threshold_tradeoff   auto-accept vs review workload across the whole grid.
+  #                      Workload only — it says nothing about correctness, so
+  #                      an elbow in it is not evidence for a production cutoff.
+  # precision_coverage   auto-accept precision vs coverage over observations
+  #                      with BOTH Town and Country independently labelled.
+  #                      This is the curve a production cutoff is argued from.
+  # error_capture_*      if review works lowest-score-first, how fast does it
+  #                      reach the cases that are actually wrong (gain), and
+  #                      how many times better than random is that (lift).
+  threshold_tradeoff_filename: "threshold_tradeoff.csv"
+  threshold_tradeoff_chart_filename: "threshold_tradeoff.png"
+  precision_coverage_filename: "precision_coverage.csv"
+  precision_coverage_chart_filename: "precision_coverage.png"
+  error_capture_gain_filename: "error_capture_gain.csv"
+  error_capture_gain_chart_filename: "error_capture_gain.png"
+  error_capture_lift_filename: "error_capture_lift.csv"
+  error_capture_lift_chart_filename: "error_capture_lift.png"
+  # Grid resolution for the trade-off and precision/coverage curves. Must
+  # satisfy 0 < step <= 1.
+  threshold_curve_step: 0.01
+  # Labelled observations required before the label-dependent analyses are
+  # produced at all. Below these the report states that the analysis is
+  # unavailable and why, rather than drawing a chart the data cannot support.
+  min_grounded_for_precision: 1
+  min_errors_for_gain: 1
   # Lower edges of the score bands. Each band is [edge, next_edge); the last is
   # closed at 1.0. Scores below the first edge fall into the "< 0.60" band.
   score_band_edges: [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]

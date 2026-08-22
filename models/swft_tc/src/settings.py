@@ -301,6 +301,27 @@ class ReportingConfig(_Base):
     cross_entropy_summary_filename: str = "cross_entropy_summary.csv"
     hitl_state_distribution_filename: str = "hitl_state_distribution.csv"
     histogram_filename: str = "composite_score_histogram.png"
+    # --- Threshold analytics -------------------------------------------------
+    # Decision-support artifacts. None of them feeds back into
+    # `scoring.hitl_threshold`: the operational cutoff stays configuration,
+    # approved separately against business risk appetite.
+    threshold_tradeoff_filename: str = "threshold_tradeoff.csv"
+    threshold_tradeoff_chart_filename: str = "threshold_tradeoff.png"
+    precision_coverage_filename: str = "precision_coverage.csv"
+    precision_coverage_chart_filename: str = "precision_coverage.png"
+    error_capture_gain_filename: str = "error_capture_gain.csv"
+    error_capture_gain_chart_filename: str = "error_capture_gain.png"
+    error_capture_lift_filename: str = "error_capture_lift.csv"
+    error_capture_lift_chart_filename: str = "error_capture_lift.png"
+    #: Grid resolution for the threshold trade-off and precision/coverage
+    #: curves. 0.01 evaluates 0.00, 0.01 ... 1.00.
+    threshold_curve_step: float = 0.01
+    #: Fully grounded observations required before a precision/coverage curve is
+    #: drawn, and labelled errors required before a Gain/Lift curve is drawn.
+    #: Below these, the report says the analysis is unavailable and why rather
+    #: than drawing a chart the labels cannot support.
+    min_grounded_for_precision: int = 1
+    min_errors_for_gain: int = 1
     #: Lower edges of the score bands. Each band is [edge, next_edge), and the
     #: final band is closed at 1.0 so a perfect score is never dropped.
     score_band_edges: tuple[float, ...] = (0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
@@ -326,6 +347,17 @@ class ReportingConfig(_Base):
                 )
         if not 0.0 <= self.recommended_threshold <= 1.0:
             raise ValueError("reporting.recommended_threshold must lie within [0, 1]")
+        if not 0.0 < self.threshold_curve_step <= 1.0:
+            raise ValueError(
+                "reporting.threshold_curve_step must satisfy 0 < step <= 1, got "
+                f"{self.threshold_curve_step}"
+            )
+        for name, minimum in (
+            ("min_grounded_for_precision", self.min_grounded_for_precision),
+            ("min_errors_for_gain", self.min_errors_for_gain),
+        ):
+            if minimum < 1:
+                raise ValueError(f"reporting.{name} must be at least 1, got {minimum}")
         return self
 
 
