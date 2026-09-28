@@ -342,3 +342,58 @@ class TestCanonicalSchemaRunsEndToEnd:
         # Every configured group produced its columns, so none was silently off.
         for group in canonical.enabled_groups:
             assert f"predicted_town_group_{group.group_id}" in result.frame.columns
+
+
+class TestRetractionExperimentGroupConfig:
+    """The retraction-experiment configuration: one group over four lines.
+
+    A dedicated test, not a duplicate of the schema suite: this file is what
+    the experiment actually loads, so its exact shape is the thing to pin.
+    """
+
+    @pytest.fixture
+    def experiment_config(self, model_root):
+        return load_group_config(
+            model_root / "config" / "group_config_retraction_experiment.csv"
+        )
+
+    def test_exactly_one_group(self, experiment_config):
+        assert len(experiment_config.groups) == 1
+
+    def test_group_id_is_one(self, experiment_config):
+        assert experiment_config.groups[0].group_id == "1"
+
+    def test_four_source_fields_in_original_order(self, experiment_config):
+        assert experiment_config.groups[0].source_fields == (
+            "address_line_1", "address_line_2", "address_line_3", "address_line_4",
+        )
+        assert experiment_config.groups[0].line_count == 4
+
+    def test_enabled_defaults_to_true_without_the_column(self, experiment_config):
+        assert experiment_config.groups[0].enabled is True
+        assert len(experiment_config.enabled_groups) == 1
+
+    def test_notes_default_to_empty_without_the_column(self, experiment_config):
+        assert experiment_config.groups[0].notes == ""
+
+    def test_file_carries_neither_optional_column(self, model_root):
+        header = (
+            (model_root / "config" / "group_config_retraction_experiment.csv")
+            .read_text(encoding="utf-8-sig").splitlines()[0]
+        )
+        assert header == (
+            "group_id,address_line_1,address_line_2,address_line_3,address_line_4"
+        )
+
+    def test_experiment_runtime_config_points_at_it(self, model_root):
+        from models.swft_tc.src.settings import load_config
+
+        config = load_config(
+            model_root / "config" / "config_retraction_experiment.yaml",
+            base_dir=model_root,
+        )
+        assert config.project.group_config_path == (
+            "config/group_config_retraction_experiment.csv"
+        )
+        # One group, so the canonical width is the 5 input columns + 20.
+        assert config.fields_per_group == 20
