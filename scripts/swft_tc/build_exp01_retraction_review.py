@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""Derive the retraction-review artifacts from a finished pipeline run.
+"""Derive the EXP-01 retraction-review artifacts from the finished baseline run.
 
-Reads the canonical output CSV a run already produced and writes, next to it:
+EXP-01 - Right-Most Town / All-Match Country Retraction Baseline
+(slug ``exp01_rightmost_town_allmatch_country``). Town: one right-most verified
+occurrence removed per group. Country: every verified occurrence/form removed.
+Entity protection: none. This script changes nothing about that: it reads the
+canonical output the run already produced and writes, next to it:
 
-* ``<prefix>_retraction_review.csv``       — the compact per-record view
-* ``<prefix>_town_in_line1_review.csv``    — records whose predicted Town occurs
+* ``<prefix>_retraction_review.csv``       - the compact per-record view
+* ``<prefix>_town_in_line1_review.csv``    - records whose predicted Town occurs
                                              as a whole token/phrase in line 1
-* ``<prefix>_diagnostics.json``            — the baseline counts
+* ``<prefix>_diagnostics.json``            - the baseline counts
 
-It makes **no model calls** and changes **nothing** about retraction: every
-value is copied from the canonical output. The Town-in-line-1 selection uses
-the pipeline's own token-safe matcher, so ``BOSTONIAN`` is never counted as a
-``BOSTON`` and a multi-token Town has to match as a whole phrase.
+where ``<prefix>`` is the canonical output's stem without ``_output``, so the
+Experiment 1 artifacts are named ``exp01_rightmost_town_allmatch_country_*``.
+
+It makes **no model calls** and never modifies the canonical output: every
+value is copied from it. The Town-in-line-1 selection uses the pipeline's own
+token-safe matcher, so ``BOSTONIAN`` is never counted as a ``BOSTON`` and a
+multi-token Town has to match as a whole phrase. Later experiments get their
+own review tooling; Experiment 2 behaviour does not belong here.
 
 Run from the repository root, after the pipeline::
 
-    python scripts/swft_tc/build_retraction_review.py \\
-        --config config/config_retraction_experiment.yaml
+    python scripts/swft_tc/build_exp01_retraction_review.py \\
+        --config config/config_exp01_rightmost_town_allmatch_country.yaml
 """
 
 from __future__ import annotations
@@ -73,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "--config",
-        default="config/config_retraction_experiment.yaml",
+        default="config/config_exp01_rightmost_town_allmatch_country.yaml",
         help="Runtime config of the finished run; relative to the model root.",
     )
     parser.add_argument("--group-id", default="1", help="Configured group to review.")

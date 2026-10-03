@@ -491,33 +491,59 @@ curves — applies the same `reporting.forced_review_mask()`, so lowering the cu
 reference-conflicted case into an auto-accept candidate in any artifact. Forced counts are reported
 separately from the score-driven ones.
 
-### Retraction experiment (baseline run)
+## Retraction Experiments
 
-`models/swft_tc/data/retraction_experiment_addresses.csv` is a 115-row set of addresses chosen to
-expose how the **current** retraction rule behaves when an organisation name contains a town
-(`CITIBANK LONDON`, `BANK OF MONTREAL`, …). It runs through the unchanged pipeline with two
-experiment-only configuration files, so the baseline `config.yaml` and `group_config.csv` are never
-touched:
+Retraction is the deterministic step that takes verified Town and Country evidence back out of
+the source lines (`models/swft_tc/src/retraction.py`). Its behaviour is frozen per experiment so
+later variants can be compared side by side without ambiguity. Experiment naming lives in the
+experiment config, input, output paths, review tooling, notebook and this section only; the core
+implementation and the production schema fields stay generic.
 
-| File | Purpose |
+### EXP-01 — Right-Most Town / All-Match Country Retraction Baseline
+
+Slug: `exp01_rightmost_town_allmatch_country`. The current algorithm, unchanged, run over a
+115-row set of addresses chosen to expose what it does when an organisation name carries a
+town or country word (`CITIBANK LONDON`, `NATIONAL BANK OF CANADA`, …).
+
+| Policy | EXP-01 behaviour |
 |---|---|
-| `models/swft_tc/config/group_config_retraction_experiment.csv` | one group over `address_line_1..4`, in order |
-| `models/swft_tc/config/config_retraction_experiment.yaml` | `config.yaml` with only the output paths changed |
+| **Town** | verified explicit evidence only; token-safe; **exactly one** occurrence removed per group — the right-most standalone one |
+| **Country** | verified explicit evidence only; token-safe; **all** verified occurrences/forms removed (code and matched aliases) |
+| **Entity protection** | none |
+
+Note the asymmetry: Town is right-most-single-occurrence, Country is all-match. The name keeps
+that distinction on purpose, and "right-most town and country" would be inaccurate.
+
+| Artifact | Path |
+|---|---|
+| Input | `models/swft_tc/data/exp01_rightmost_town_allmatch_country_addresses.csv` |
+| Runtime config | `models/swft_tc/config/config_exp01_rightmost_town_allmatch_country.yaml` (`config.yaml` with only paths changed) |
+| Group config | `models/swft_tc/config/group_config_exp01_rightmost_town_allmatch_country.csv` (one group over `address_line_1..4`) |
+| Analysis notebook | `notebooks/swft_tc/02_exp01_rightmost_town_allmatch_country_analysis.ipynb` |
+| Review builder | `scripts/swft_tc/build_exp01_retraction_review.py` |
+| Canonical output | `models/swft_tc/outputs/exp01_rightmost_town_allmatch_country_output.csv` (+ `_detailed_output.jsonl`, `_run_metrics.json`) |
+| Reports / charts / cache | `models/swft_tc/outputs/exp01_rightmost_town_allmatch_country/{reports,charts,address_cache.jsonl}` |
 
 ```bash
 python scripts/swft_tc/run_batch.py \
-    --config config/config_retraction_experiment.yaml \
-    --input  data/retraction_experiment_addresses.csv
-python scripts/swft_tc/build_retraction_review.py \
-    --config config/config_retraction_experiment.yaml
+    --config config/config_exp01_rightmost_town_allmatch_country.yaml \
+    --input  data/exp01_rightmost_town_allmatch_country_addresses.csv
+python scripts/swft_tc/build_exp01_retraction_review.py \
+    --config config/config_exp01_rightmost_town_allmatch_country.yaml
 ```
 
 The first command writes the canonical 25-column output (5 input columns + the 20 group fields),
-detailed JSONL, metrics, errors and reports under experiment-specific paths. The second derives —
-with no model calls — a compact retraction-review CSV, a Town-in-line-1 review CSV, and a
-diagnostics JSON from that output. All of it is git-ignored: it carries raw addresses. The run
-needs model credentials and the configured Town/Country reference file; it does not fall back
-silently when either is missing.
+detailed JSONL, metrics, errors and reports. The second derives — with no model calls — the
+compact retraction-review CSV, the Town-in-line-1 review CSV and a diagnostics JSON. All of it is
+git-ignored: it carries raw addresses. The run needs model credentials and the configured
+Town/Country reference file; it does not fall back silently when either is missing.
+
+Known baseline risk: because Country retraction is all-match and no entity boundary is used,
+country terms inside organisation names are removed (`NATIONAL BANK OF CANADA` → `NATIONAL BANK
+OF`). Town terms inside an entity name survive only when the locality repeats the town later.
+
+> **EXP-01 is a baseline experiment.** It should not be described as the final production
+> retraction strategy; it is the reference that later experiments are measured against.
 
 ### Threshold analytics
 
