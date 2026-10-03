@@ -491,6 +491,34 @@ curves — applies the same `reporting.forced_review_mask()`, so lowering the cu
 reference-conflicted case into an auto-accept candidate in any artifact. Forced counts are reported
 separately from the score-driven ones.
 
+### Retraction experiment (baseline run)
+
+`models/swft_tc/data/retraction_experiment_addresses.csv` is a 115-row set of addresses chosen to
+expose how the **current** retraction rule behaves when an organisation name contains a town
+(`CITIBANK LONDON`, `BANK OF MONTREAL`, …). It runs through the unchanged pipeline with two
+experiment-only configuration files, so the baseline `config.yaml` and `group_config.csv` are never
+touched:
+
+| File | Purpose |
+|---|---|
+| `models/swft_tc/config/group_config_retraction_experiment.csv` | one group over `address_line_1..4`, in order |
+| `models/swft_tc/config/config_retraction_experiment.yaml` | `config.yaml` with only the output paths changed |
+
+```bash
+python scripts/swft_tc/run_batch.py \
+    --config config/config_retraction_experiment.yaml \
+    --input  data/retraction_experiment_addresses.csv
+python scripts/swft_tc/build_retraction_review.py \
+    --config config/config_retraction_experiment.yaml
+```
+
+The first command writes the canonical 25-column output (5 input columns + the 20 group fields),
+detailed JSONL, metrics, errors and reports under experiment-specific paths. The second derives —
+with no model calls — a compact retraction-review CSV, a Town-in-line-1 review CSV, and a
+diagnostics JSON from that output. All of it is git-ignored: it carries raw addresses. The run
+needs model credentials and the configured Town/Country reference file; it does not fall back
+silently when either is missing.
+
 ### Threshold analytics
 
 Four analyses, answering four different questions. Only one of them measures quality, and **none of
