@@ -1,12 +1,39 @@
-# SWIFT Address Extraction — Phase 1 runtime configuration.
+# EXP-02 — Line-1 Protected / Confidence-Gated Retraction
+# slug: exp02_line1_protected_confidence_gated
 #
-# This is the file the pipeline actually loads (override with
-# SWIFT_ADDRESS_CONFIG). It is a superset of `config.example.yaml`; every key
-# added beyond the example is marked "[EXTENSION]" with the reason.
+# A controlled CHALLENGER to EXP-01 (Right-Most Town / All-Match Country
+# Retraction Baseline). It changes retraction ELIGIBILITY only. Extraction,
+# reference validation, probabilities, Composite Weighted Score, cross-entropy
+# and HITL policy are byte-for-byte the baseline; so are the prompt, the model
+# runtime values, the group config and the 115-record input, which are REUSED
+# from EXP-01 rather than copied.
+#
+# Two new retraction controls (the `retraction:` section at the bottom):
+#   1. The first configured source field of every group (address_line_1 here)
+#      is PROTECTED from retraction. It still takes part in the combined
+#      address, extraction, verification, reference validation, scoring and
+#      HITL — it is only never modified, and an occurrence inside it is never
+#      eligible.
+#   2. Town and Country are retracted only when their own model probability is
+#      STRICTLY greater than 0.80 (0.80 itself does not retract). The two are
+#      gated independently.
+# Within the eligible fields the EXP-01 rules are unchanged: one right-most
+# Town occurrence; all verified Country occurrences/forms.
+#
+# Cache: because nothing the cache key depends on changed (prompt version,
+# model, address text, reference context version), the EXP-01 cache seeds this
+# experiment. Copy outputs/exp01_rightmost_town_allmatch_country/address_cache.jsonl
+# to the cache_path below (never share one writable cache file) and a LIVE run
+# makes zero model calls. A --dry-run keys the cache on the stub model name and
+# would MISS; do not use it to reproduce EXP-02.
+#
+# Run from the repository root:
+#   python scripts/swft_tc/run_batch.py \
+#       --config config/config_exp02_line1_protected_confidence_gated.yaml \
+#       --input  data/exp01_rightmost_town_allmatch_country_addresses.csv
 #
 # No secrets belong in this file. Credentials come from environment variables
 # only (see `.env.example`).
-
 project:
   prompt_version: "v6-lima-postal-inference"
   record_id_column: "RECORD_ID"
@@ -14,7 +41,7 @@ project:
   # place so the prompt is never duplicated across modules.
   prompt_path: "prompts/GEMINI_EXTRACTION_PROMPT.md"
   # [EXTENSION] Group configuration file (CSV or YAML).
-  group_config_path: "config/group_config.csv"
+  group_config_path: "config/group_config_exp01_rightmost_town_allmatch_country.csv"
 
 input:
   preserve_all_columns: true
@@ -107,19 +134,19 @@ model:
 processing:
   deduplicate_addresses: true
   cache_enabled: true
-  cache_path: "outputs/address_cache.jsonl"
-  errors_path: "outputs/errors/processing_errors.csv"
-  metrics_path: "outputs/run_metrics.json"
+  cache_path: "outputs/exp02_line1_protected_confidence_gated/address_cache.jsonl"
+  errors_path: "outputs/errors/exp02_line1_protected_confidence_gated_processing_errors.csv"
+  metrics_path: "outputs/exp02_line1_protected_confidence_gated_run_metrics.json"
   redact_raw_address_in_logs: true
   # [EXTENSION] Default destination for the expanded output CSV.
-  output_path: "outputs/phase1_output.csv"
+  output_path: "outputs/exp02_line1_protected_confidence_gated_output.csv"
   # [EXTENSION] Nested per-record detail. The CSV stays the flat compatibility
   # artifact; audit and evaluation depth lives here instead of growing dozens
   # more columns. JSON Lines by default so large runs stream one record at a
   # time rather than building one huge in-memory array. Contains raw address
   # data — treat as sensitive; outputs/ is git-ignored.
   detailed_json_enabled: true
-  detailed_json_path: "outputs/phase1_detailed_output.jsonl"
+  detailed_json_path: "outputs/exp02_line1_protected_confidence_gated_detailed_output.jsonl"
   detailed_json_format: "jsonl"     # "jsonl" (default) | "json" (small dev runs)
   detailed_json_include_empty_groups: true
 
@@ -177,8 +204,8 @@ reference_data:
 
 reporting:
   enabled: true
-  reports_dir: "outputs/reports"
-  charts_dir: "outputs/charts"
+  reports_dir: "outputs/exp02_line1_protected_confidence_gated/reports"
+  charts_dir: "outputs/exp02_line1_protected_confidence_gated/charts"
   executive_summary_filename: "executive_summary.json"
   score_distribution_filename: "score_distribution.csv"
   threshold_sensitivity_filename: "threshold_sensitivity.csv"
@@ -264,11 +291,13 @@ scoring:
       town_weight: 0.20
       country_weight: 0.00
 
-# --- Retraction policy (optional) --------------------------------------------
-# Omitted here on purpose: the defaults ARE the production baseline (no
-# protected source field, no probability gate). Experiment configs may add:
-#   retraction:
-#     policy_name: "<label recorded in the detailed JSON>"
-#     protected_source_positions: [1]      # 1-based ordinals never modified
-#     town_probability_threshold: 0.80     # retract only if probability > 0.80
-#     country_probability_threshold: 0.80  # null = no gate
+# --- EXP-02 retraction policy (the only behavioural difference from EXP-01) --
+# Absent in EXP-01 and in config.yaml, where the defaults (no protected field,
+# no gate) reproduce the baseline exactly. Positions are 1-based ordinals into
+# each group's configured source_fields; thresholds are strict (> not >=) and
+# null means no gate at all.
+retraction:
+  policy_name: "line1_protected_confidence_gated"
+  protected_source_positions: [1]
+  town_probability_threshold: 0.80
+  country_probability_threshold: 0.80

@@ -28,6 +28,7 @@ __all__ = [
     "ProjectConfig",
     "ReferenceDataConfig",
     "ReportingConfig",
+    "RetractionConfig",
     "ScenarioWeights",
     "ScoringConfig",
     "NULLABLE_BOOLEAN_FIELD_KEYS",
@@ -361,6 +362,46 @@ class ReportingConfig(_Base):
         return self
 
 
+class RetractionConfig(_Base):
+    """Retraction eligibility policy. Absent section == the production baseline.
+
+    The baseline (EXP-01 — right-most Town / all-match Country) is what every
+    field here defaults to: no protected source field and no probability gate.
+    A configuration that omits the section therefore behaves exactly as before.
+
+    ``protected_source_positions`` are 1-based ordinals into each group's
+    configured ``source_fields``: ``[1]`` protects the first configured line
+    of every group from retraction. The line still takes part in the combined
+    address, extraction, verification, reference validation, scoring and HITL;
+    it is only never *modified*.
+
+    ``*_probability_threshold`` gate retraction on the model's own probability
+    for that entity: retract only when ``probability > threshold`` (strictly).
+    ``None`` means no gate at all, which is the baseline — not a threshold of
+    0.0, which would subtly reclassify a zero-probability edge case.
+    """
+
+    policy_name: str = "rightmost_town_allmatch_country"
+    protected_source_positions: tuple[int, ...] = ()
+    town_probability_threshold: float | None = None
+    country_probability_threshold: float | None = None
+
+    @model_validator(mode="after")
+    def _validate(self) -> "RetractionConfig":
+        positions = list(self.protected_source_positions)
+        if any(int(pos) < 1 for pos in positions):
+            raise ValueError("retraction.protected_source_positions are 1-based and must be >= 1")
+        if len(set(positions)) != len(positions):
+            raise ValueError("retraction.protected_source_positions must not repeat")
+        for name, value in (
+            ("town_probability_threshold", self.town_probability_threshold),
+            ("country_probability_threshold", self.country_probability_threshold),
+        ):
+            if value is not None and not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"retraction.{name} must lie within [0, 1] or be null")
+        return self
+
+
 class ScenarioWeights(_Base):
     town_weight: float
     country_weight: float
@@ -415,6 +456,8 @@ class AppConfig(_Base):
     reference_data: ReferenceDataConfig = Field(default_factory=ReferenceDataConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
     scoring: ScoringConfig
+    #: Optional. Omitted => the baseline retraction policy, unchanged.
+    retraction: RetractionConfig = Field(default_factory=RetractionConfig)
 
     #: Directory every relative path in the config is resolved against.
     base_dir: Path = Field(default_factory=lambda: MODEL_ROOT)
