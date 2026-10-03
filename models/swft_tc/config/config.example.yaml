@@ -134,3 +134,12 @@ scoring:
     no_defensible_prediction:
       town_weight: 0.00
       country_weight: 0.00
+
+# --- Retraction policy (optional) --------------------------------------------
+# Omitted here on purpose: the defaults ARE the production baseline (no
+# protected source field, no probability gate). Experiment configs may add:
+#   retraction:
+#     policy_name: "<label recorded in the detailed JSON>"
+#     protected_source_positions: [1]      # 1-based ordinals never modified
+#     town_probability_threshold: 0.80     # retract only if probability > 0.80
+#     country_probability_threshold: 0.80  # null = no gate

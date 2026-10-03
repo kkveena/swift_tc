@@ -63,7 +63,7 @@ from .evaluation import (
     null_cross_entropy,
     null_ground_truth,
 )
-from .retraction import RetractionResult, null_retraction, retract_group
+from .retraction import RetractionPolicy, RetractionResult, null_retraction, retract_group
 from .scoring import (
     HitlDecision,
     ScoreResult,
@@ -220,6 +220,10 @@ class Phase1Pipeline:
         town_country_provider: TownCountryProvider | None = None,
     ) -> None:
         self.config = config
+        # Eligibility policy for retraction. Absent config section => baseline.
+        self.retraction_policy = RetractionPolicy.from_config(
+            getattr(config, "retraction", None)
+        )
         self.group_config = group_config
         self.client = client
         self.reference_provider = reference_provider
@@ -641,6 +645,9 @@ class Phase1Pipeline:
             country_exists=verified.country_exists,
             iso_provider=self.iso_provider,
             zero_is_missing=self.config.input.zero_field_is_missing,
+            town_probability=float(verified.town_probability),
+            country_probability=float(verified.country_probability),
+            policy=self.retraction_policy,
         )
 
     # -- reporting ---------------------------------------------------------

@@ -545,6 +545,68 @@ OF`). Town terms inside an entity name survive only when the locality repeats th
 > **EXP-01 is a baseline experiment.** It should not be described as the final production
 > retraction strategy; it is the reference that later experiments are measured against.
 
+### EXP-02 — Line-1 Protected / Confidence-Gated Retraction
+
+Slug: `exp02_line1_protected_confidence_gated`. A controlled challenger to EXP-01 that changes
+**retraction eligibility only**. Extraction, reference validation, probabilities, Composite
+Weighted Score, cross-entropy and HITL policy are byte-for-byte the baseline, and so are the
+prompt, model runtime values, group config and the 115-record input — EXP-02 reuses EXP-01's
+group config and input rather than copying them.
+
+| Control | EXP-02 behaviour |
+|---|---|
+| **Line-1 protection** | the first configured source field of every group is never modified by retraction. It still takes part in the combined address, extraction, verification, reference validation, scoring and HITL; an occurrence inside it is simply never eligible |
+| **Town gate** | Town is retracted only when `predicted_town_probability` is **strictly greater than 0.80** — 0.80 itself does not retract |
+| **Country gate** | the same, independently, on `predicted_country_probability` |
+| **Within eligible fields** | unchanged EXP-01 rules: one right-most Town occurrence; all verified Country occurrences/forms |
+
+The policy is configuration, not code: a `retraction:` section in the experiment config
+(`policy_name`, `protected_source_positions: [1]`, `town_probability_threshold`,
+`country_probability_threshold`). A config without the section — EXP-01 and `config.yaml` — gets
+the defaults, which are the baseline exactly: no protected field and `null` thresholds meaning
+*no gate*, never a threshold of 0.0. Protected positions are 1-based ordinals into the group's
+configured source fields, so the rule reads "protect the first configured line", not a literal
+column name.
+
+| Artifact | Path |
+|---|---|
+| Runtime config | `models/swft_tc/config/config_exp02_line1_protected_confidence_gated.yaml` |
+| Group config / input | reused from EXP-01 |
+| Analysis notebook | `notebooks/swft_tc/03_exp02_line1_protected_confidence_gated_analysis.ipynb` (EXP-02 alone, and side by side with EXP-01) |
+| Review builder | `scripts/swft_tc/build_exp02_retraction_review.py` |
+| Canonical output | `models/swft_tc/outputs/exp02_line1_protected_confidence_gated_output.csv` (+ `_detailed_output.jsonl`, `_run_metrics.json`) |
+| Reports / charts / cache | `models/swft_tc/outputs/exp02_line1_protected_confidence_gated/{reports,charts,address_cache.jsonl}` |
+
+**Zero new model calls.** The address cache stores the raw model response *before*
+verification, scoring, HITL and retraction, keyed on prompt version, model, address text and
+reference context version — none of which EXP-02 changes. Copy the EXP-01 cache to EXP-02's own
+cache path (never point both experiments at one writable file) and a live run replays every
+address from cache, re-deriving retraction under the new policy:
+
+```bash
+mkdir -p models/swft_tc/outputs/exp02_line1_protected_confidence_gated
+cp models/swft_tc/outputs/exp01_rightmost_town_allmatch_country/address_cache.jsonl \
+   models/swft_tc/outputs/exp02_line1_protected_confidence_gated/address_cache.jsonl
+python scripts/swft_tc/run_batch.py \
+    --config config/config_exp02_line1_protected_confidence_gated.yaml \
+    --input  data/exp01_rightmost_town_allmatch_country_addresses.csv
+python scripts/swft_tc/build_exp02_retraction_review.py
+```
+
+Expect `backend calls : 0` in the run summary. A `--dry-run` keys the cache on the stub model
+name and would miss every entry, so it cannot reproduce EXP-02; run live with credentials.
+
+The detailed JSON retraction block records every eligibility decision — `policy_name`,
+`protected_source_fields`, the two gates, whether each passed, whether each entity was eligible,
+and a `*_skip_reason` (`not_explicitly_verified`, `probability_not_above_threshold`,
+`protected_source_only`, `no_eligible_occurrence`). No CSV column was added. Under EXP-01 the
+same keys appear with their baseline values, so the two runs are directly comparable.
+
+> **EXP-02 measures policy behaviour.** Any difference in predicted Town/Country, their
+> probabilities or their `*_exists` flags between EXP-01 and EXP-02 is experiment contamination,
+> not a result; the notebook checks for it before comparing retraction.
+
+
 ### Threshold analytics
 
 Four analyses, answering four different questions. Only one of them measures quality, and **none of

@@ -25,7 +25,7 @@ from typing import Any, Iterable, Iterator, Mapping
 import pandas as pd
 
 from .evaluation import null_cross_entropy, null_ground_truth
-from .retraction import RetractionResult, null_retraction, retract_group
+from .retraction import BASELINE_POLICY, RetractionPolicy, RetractionResult, null_retraction, retract_group
 from .schemas import NO_COUNTRY, NO_TOWN
 
 __all__ = [
@@ -121,6 +121,7 @@ def build_record_document(
             decision=decisions_by_address.get(cleaned),
             iso_provider=iso_provider,
             zero_is_missing=config.input.zero_field_is_missing,
+            policy=RetractionPolicy.from_config(getattr(config, "retraction", None)),
         )
 
     return {
@@ -189,6 +190,7 @@ def _group_document(
     decision: Any,
     iso_provider: Any,
     zero_is_missing: bool,
+    policy: RetractionPolicy = BASELINE_POLICY,
 ) -> dict[str, Any]:
     source_values = {
         field_name: str(row.get(field_name, "") or "")
@@ -199,6 +201,18 @@ def _group_document(
     country_value = str(column("predicted_country") or "")
     town_exists = bool(_bool_or_none(column("predicted_town_exists")))
     country_exists = bool(_bool_or_none(column("predicted_country_exists")))
+
+    # The policy gates on the model's own probabilities. Prefer the decision's
+    # exact values; fall back to the CSV columns when no decision is attached.
+    verified = getattr(decision, "verified", None)
+    town_probability = (
+        float(verified.town_probability) if verified is not None
+        else _float_or_none(column("predicted_town_probability"))
+    )
+    country_probability = (
+        float(verified.country_probability) if verified is not None
+        else _float_or_none(column("predicted_country_probability"))
+    )
 
     # Recomputed from the same pure function the CSV columns used, so the two
     # representations cannot drift apart. A test asserts they agree.
@@ -211,9 +225,10 @@ def _group_document(
         country_exists=country_exists,
         iso_provider=iso_provider,
         zero_is_missing=zero_is_missing,
+        town_probability=town_probability,
+        country_probability=country_probability,
+        policy=policy,
     )
-
-    verified = getattr(decision, "verified", None)
     score = getattr(decision, "score", None)
     ground_truth = getattr(decision, "ground_truth", None) or null_ground_truth()
     cross_entropy = getattr(decision, "cross_entropy", None) or null_cross_entropy()

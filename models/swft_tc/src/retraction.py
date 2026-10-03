@@ -37,7 +37,14 @@ from .grouping import build_combined_address
 from .schemas import NO_COUNTRY, NO_TOWN
 
 __all__ = [
+    "BASELINE_POLICY",
+    "BASELINE_POLICY_NAME",
+    "RetractionPolicy",
     "RetractionResult",
+    "SKIP_NOT_VERIFIED",
+    "SKIP_NO_ELIGIBLE_OCCURRENCE",
+    "SKIP_PROBABILITY",
+    "SKIP_PROTECTED_ONLY",
     "TokenSpan",
     "null_retraction",
     "remove_token_phrases",
@@ -48,6 +55,86 @@ __all__ = [
 
 #: Characters treated as separators when a removal leaves an orphaned delimiter.
 _SEPARATORS = ",;:/|-–—"
+
+#: The production baseline policy name (EXP-01): right-most single Town
+#: occurrence, all verified Country occurrences, nothing protected, no gate.
+BASELINE_POLICY_NAME = "rightmost_town_allmatch_country"
+
+#: Why an entity that was *predicted* was nevertheless not retracted. Audit
+#: values only — never CSV columns.
+SKIP_NOT_VERIFIED = "not_explicitly_verified"
+SKIP_PROBABILITY = "probability_not_above_threshold"
+SKIP_PROTECTED_ONLY = "protected_source_only"
+SKIP_NO_ELIGIBLE_OCCURRENCE = "no_eligible_occurrence"
+
+
+@dataclass(frozen=True)
+class RetractionPolicy:
+    """What may be retracted, and from where. Pure data; no behaviour of its own.
+
+    ``protected_source_positions`` are 1-based ordinals into a group's
+    configured source fields — ``(1,)`` protects the first configured line of
+    every group, whatever it is called. A protected field still contributes to
+    the combined address and to every upstream judgement; it is only never
+    modified by retraction, and an occurrence inside it never counts as
+    eligible.
+
+    ``*_probability_threshold`` is a strict gate: an entity is eligible only
+    when its own model probability is **greater than** the threshold. ``None``
+    means no gate. The default instance is the production baseline.
+    """
+
+    name: str = BASELINE_POLICY_NAME
+    protected_source_positions: tuple[int, ...] = ()
+    town_probability_threshold: float | None = None
+    country_probability_threshold: float | None = None
+
+    @classmethod
+    def from_config(cls, config: Any) -> "RetractionPolicy":
+        """Build from a ``RetractionConfig`` (or ``None`` → the baseline)."""
+        if config is None:
+            return BASELINE_POLICY
+        return cls(
+            name=str(getattr(config, "policy_name", BASELINE_POLICY_NAME)),
+            protected_source_positions=tuple(
+                int(p) for p in getattr(config, "protected_source_positions", ()) or ()
+            ),
+            town_probability_threshold=getattr(config, "town_probability_threshold", None),
+            country_probability_threshold=getattr(config, "country_probability_threshold", None),
+        )
+
+    @property
+    def is_baseline(self) -> bool:
+        return (
+            not self.protected_source_positions
+            and self.town_probability_threshold is None
+            and self.country_probability_threshold is None
+        )
+
+    def protected_fields(self, source_fields: Sequence[str]) -> tuple[str, ...]:
+        """The configured field names the policy protects, in field order."""
+        fields = list(source_fields)
+        return tuple(
+            fields[pos - 1]
+            for pos in sorted(set(self.protected_source_positions))
+            if 1 <= pos <= len(fields)
+        )
+
+    @staticmethod
+    def passes(probability: float | None, threshold: float | None) -> bool:
+        """Strict gate: ``probability > threshold``. No threshold → always passes.
+
+        A missing probability cannot clear a configured gate — the policy asks
+        for evidence of confidence, and none was supplied.
+        """
+        if threshold is None:
+            return True
+        if probability is None:
+            return False
+        return float(probability) > float(threshold)
+
+
+BASELINE_POLICY = RetractionPolicy()
 
 
 @dataclass(frozen=True)
@@ -80,6 +167,18 @@ class RetractionResult:
     #: deliberately left partly in place. Audit only — never a CSV column.
     town_occurrences_found: int = 0
     town_occurrences_removed: int = 0
+    #: Policy audit. Under the baseline policy these carry their defaults; a
+    #: challenger policy makes every eligibility decision visible here.
+    policy_name: str = BASELINE_POLICY_NAME
+    protected_source_fields: tuple[str, ...] = ()
+    town_probability_gate: float | None = None
+    country_probability_gate: float | None = None
+    town_probability_gate_passed: bool = True
+    country_probability_gate_passed: bool = True
+    town_retraction_eligible: bool = False
+    country_retraction_eligible: bool = False
+    town_skip_reason: str | None = None
+    country_skip_reason: str | None = None
 
     @property
     def changed(self) -> bool:
@@ -95,6 +194,16 @@ class RetractionResult:
             "removed_forms": list(self.removed_forms),
             "town_occurrences_found": self.town_occurrences_found,
             "town_occurrences_removed": self.town_occurrences_removed,
+            "policy_name": self.policy_name,
+            "protected_source_fields": list(self.protected_source_fields),
+            "town_probability_gate": self.town_probability_gate,
+            "country_probability_gate": self.country_probability_gate,
+            "town_probability_gate_passed": self.town_probability_gate_passed,
+            "country_probability_gate_passed": self.country_probability_gate_passed,
+            "town_retraction_eligible": self.town_retraction_eligible,
+            "country_retraction_eligible": self.country_retraction_eligible,
+            "town_skip_reason": self.town_skip_reason,
+            "country_skip_reason": self.country_skip_reason,
         }
 
 
@@ -286,6 +395,9 @@ def retract_group(
     country_exists: bool,
     iso_provider: Any = None,
     zero_is_missing: bool = True,
+    town_probability: float | None = None,
+    country_probability: float | None = None,
+    policy: RetractionPolicy = BASELINE_POLICY,
 ) -> RetractionResult:
     """Retract verified Town/Country evidence from one group's source columns.
 
@@ -293,13 +405,19 @@ def retract_group(
     The retracted combined address is rebuilt from the after-values with
     :func:`models.swft_tc.src.grouping.build_combined_address`, so it follows exactly
     the same joining and missing-field conventions as Pass 1.
+
+    ``policy`` decides *eligibility*; it never changes what counts as verified.
+    With the default :data:`BASELINE_POLICY` (no protected field, no gate) the
+    outcome — values and comment — is byte-for-byte the production baseline.
     """
     before = {
         field_name: trim_field(source_values.get(field_name))
         for field_name in source_fields
     }
+    protected = policy.protected_fields(source_fields)
+    eligible_fields = [name for name in source_fields if name not in protected]
 
-    retract_town = bool(town_exists and town not in {"", NO_TOWN})
+    town_verified = bool(town_exists and town not in {"", NO_TOWN})
     country_codes = (
         [code for code in country_value.split(",") if code]
         if country_exists and country_value not in {"", NO_COUNTRY}
@@ -308,52 +426,34 @@ def retract_group(
     # A comma-separated candidate set is unresolved by definition, and
     # `country_exists` is only ever True for a single resolved code — but guard
     # explicitly rather than relying on that invariant holding forever.
-    retract_country = bool(country_codes) and len(country_codes) == 1
+    country_verified = bool(country_codes) and len(country_codes) == 1
 
-    if not retract_town and not retract_country:
-        combined = build_combined_address(
-            [before[name] for name in source_fields], zero_is_missing=zero_is_missing
-        )
-        return RetractionResult(
-            before=before,
-            after=dict(before),
-            combined_address_retracted=clean_address(combined),
-            comment=_comment(False, False, town, "", ()),
-            retracted_entities=(),
-        )
-
-    code = country_codes[0] if retract_country else ""
-
-    # Which textual country forms are eligible is decided ONCE, against the
-    # combined address — the same text that produced `country_exists`. Deciding
-    # it per field would be wrong: a token sitting mid-address can be in the
-    # trailing window of its own short field, which is how "SUITE 5 IN TOWER"
-    # would otherwise lose its preposition.
-    combined_before = build_combined_address(
-        [before[name] for name in source_fields], zero_is_missing=zero_is_missing
+    town_gate_passed = policy.passes(town_probability, policy.town_probability_threshold)
+    country_gate_passed = policy.passes(
+        country_probability, policy.country_probability_threshold
     )
-    if retract_country and iso_provider is not None:
-        eligible_forms = list(iso_provider.matched_presence_forms(combined_before, code))
-        code_is_ambiguous = iso_provider.is_ambiguous_alpha2(code)
-        trailing_window = iso_provider.trailing_country_token_window
-    else:
-        eligible_forms = [code] if retract_country else []
-        code_is_ambiguous = False
-        trailing_window = 0
 
-    # Unrestricted forms: full country names, and non-colliding codes.
-    open_forms = [
-        form for form in eligible_forms
-        if not (code_is_ambiguous and form.upper() == code.upper())
-    ]
-    # A colliding code is only removable in trailing country position, and only
-    # from the field that actually carries the address tail.
-    restricted_code = (
-        code if (code_is_ambiguous and code in eligible_forms) else ""
+    town_skip: str | None = None
+    if not town_verified:
+        town_skip = SKIP_NOT_VERIFIED
+    elif not town_gate_passed:
+        town_skip = SKIP_PROBABILITY
+    country_skip: str | None = None
+    if not country_verified:
+        country_skip = SKIP_NOT_VERIFIED
+    elif not country_gate_passed:
+        country_skip = SKIP_PROBABILITY
+
+    audit = dict(
+        policy_name=policy.name,
+        protected_source_fields=protected,
+        town_probability_gate=policy.town_probability_threshold,
+        country_probability_gate=policy.country_probability_threshold,
+        town_probability_gate_passed=town_gate_passed,
+        country_probability_gate_passed=country_gate_passed,
     )
-    tail_field = _last_non_empty_field(before, source_fields)
 
-    # --- Town: at most ONE occurrence per GROUP, the right-most one ---------
+    # --- Town: at most ONE occurrence per GROUP, the right-most ELIGIBLE one ---
     # A Town can legitimately appear more than once in one address — once inside
     # an institution, building or branch name, and once as the locality itself
     # ("CITIGROUP CENTRE AUCKLAND AUCKLAND"). Removing every occurrence deletes
@@ -363,11 +463,12 @@ def retract_group(
     # Which one is a deterministic positional choice, not a semantic guess: the
     # right-most standalone occurrence across the configured source fields in
     # configuration order, because the locality sits later in an address than a
-    # descriptive prefix does. The scan spans the whole group, so a Town in the
-    # final line wins over an earlier one in a previous line.
+    # descriptive prefix does. Protected fields never qualify, so under a policy
+    # that protects line 1 the choice is made among the later lines only — and
+    # if the Town occurs nowhere else, nothing is removed.
     town_occurrences_found = 0
     town_target_field = ""
-    if retract_town:
+    if town_verified:
         for field_name in source_fields:
             value = before[field_name]
             if not value:
@@ -375,7 +476,89 @@ def retract_group(
             occurrences = len(token_phrase_matches(value, town))
             if occurrences:
                 town_occurrences_found += occurrences
-                town_target_field = field_name
+                if field_name in eligible_fields:
+                    town_target_field = field_name
+    if town_skip is None:
+        if town_occurrences_found == 0:
+            town_skip = SKIP_NO_ELIGIBLE_OCCURRENCE
+        elif not town_target_field:
+            town_skip = SKIP_PROTECTED_ONLY
+    retract_town = town_skip is None
+
+    # --- Country forms ------------------------------------------------------
+    # Which textual country forms are eligible is decided ONCE, against the
+    # combined address — the same text that produced `country_exists`. Deciding
+    # it per field would be wrong: a token sitting mid-address can be in the
+    # trailing window of its own short field, which is how "SUITE 5 IN TOWER"
+    # would otherwise lose its preposition.
+    combined_before = build_combined_address(
+        [before[name] for name in source_fields], zero_is_missing=zero_is_missing
+    )
+    code = country_codes[0] if country_verified else ""
+    if country_verified and iso_provider is not None:
+        eligible_forms = list(iso_provider.matched_presence_forms(combined_before, code))
+        code_is_ambiguous = iso_provider.is_ambiguous_alpha2(code)
+        trailing_window = iso_provider.trailing_country_token_window
+    else:
+        eligible_forms = [code] if country_verified else []
+        code_is_ambiguous = False
+        trailing_window = 0
+
+    # Unrestricted forms: full country names, and non-colliding codes.
+    open_forms = [
+        form for form in eligible_forms
+        if not (code_is_ambiguous and form.upper() == code.upper())
+    ]
+    # A colliding code is only removable in trailing country position, and only
+    # from the field that actually carries the address tail — and then only if
+    # that field may be modified at all.
+    restricted_code = (
+        code if (code_is_ambiguous and code in eligible_forms) else ""
+    )
+    tail_field = _last_non_empty_field(before, source_fields)
+    restricted_field = tail_field if tail_field in eligible_fields else ""
+
+    def _country_occurrences(fields: Sequence[str]) -> int:
+        count = 0
+        for field_name in fields:
+            value = before[field_name]
+            if not value:
+                continue
+            for form in open_forms:
+                count += len(token_phrase_matches(value, form))
+            if restricted_code and field_name == tail_field:
+                count += len(
+                    token_phrase_matches(
+                        value, restricted_code, restrict_to_trailing_tokens=trailing_window
+                    )
+                )
+        return count
+
+    if country_skip is None:
+        found_anywhere = _country_occurrences(list(source_fields))
+        found_eligible = _country_occurrences(eligible_fields)
+        if found_anywhere == 0:
+            country_skip = SKIP_NO_ELIGIBLE_OCCURRENCE
+        elif found_eligible == 0:
+            country_skip = SKIP_PROTECTED_ONLY
+    retract_country = country_skip is None
+
+    if not retract_town and not retract_country:
+        result = RetractionResult(
+            before=before,
+            after=dict(before),
+            combined_address_retracted=clean_address(combined_before),
+            comment="",
+            retracted_entities=(),
+            town_occurrences_found=town_occurrences_found,
+            town_retraction_eligible=False,
+            country_retraction_eligible=False,
+            town_skip_reason=town_skip,
+            country_skip_reason=country_skip,
+            **audit,
+        )
+        return _with_comment(result, policy, town, code, town_removed=False,
+                             country_removed=False, removed_forms=())
 
     after: dict[str, str] = {}
     removed_forms: list[str] = []
@@ -394,7 +577,8 @@ def retract_group(
 
     for field_name in source_fields:
         value = before[field_name]
-        if not value:
+        if not value or field_name not in eligible_fields:
+            # Empty, or protected: copied through untouched.
             after[field_name] = value
             continue
 
@@ -402,8 +586,8 @@ def retract_group(
 
         # Town first, so the single occurrence is chosen against the field text
         # exactly as it was written rather than against a country-stripped
-        # remnant. Only the one field carrying the right-most occurrence is
-        # touched; every earlier occurrence, in this field or any other, stays.
+        # remnant. Only the one field carrying the right-most eligible
+        # occurrence is touched; every earlier occurrence stays.
         if retract_town and field_name == town_target_field:
             updated, removed = remove_token_phrases(
                 updated, [town], max_occurrences=1, prefer_last=True
@@ -412,15 +596,15 @@ def retract_group(
                 _note(form)
                 town_occurrences_removed += 1
 
-        # Country keeps its existing rule: every verified occurrence goes, since
-        # a country code repeated in the text is one piece of evidence stated
+        # Country keeps its rule: every verified occurrence goes, since a
+        # country code repeated in the text is one piece of evidence stated
         # twice, not two separate facts.
-        if open_forms:
+        if retract_country and open_forms:
             updated, removed = remove_token_phrases(updated, open_forms)
             for form in removed:
                 _note(form)
 
-        if restricted_code and field_name == tail_field:
+        if retract_country and restricted_code and field_name == restricted_field:
             updated, removed = remove_token_phrases(
                 updated, [restricted_code],
                 restrict_to_trailing_tokens=trailing_window,
@@ -440,16 +624,96 @@ def retract_group(
     if country_removed:
         entities.append("country")
 
-    return RetractionResult(
+    # An entity judged eligible whose text was then consumed by the other
+    # entity's removal (overlapping spans) was not retracted on its own merits.
+    if retract_country and not country_removed and country_skip is None:
+        country_skip = SKIP_NO_ELIGIBLE_OCCURRENCE
+    if retract_town and not town_removed and town_skip is None:
+        town_skip = SKIP_NO_ELIGIBLE_OCCURRENCE
+
+    result = RetractionResult(
         before=before,
         after=after,
         combined_address_retracted=clean_address(combined),
-        comment=_comment(town_removed, country_removed, town, code, tuple(removed_forms)),
+        comment="",
         retracted_entities=tuple(entities),
         removed_forms=tuple(removed_forms),
         town_occurrences_found=town_occurrences_found,
         town_occurrences_removed=town_occurrences_removed,
+        town_retraction_eligible=retract_town,
+        country_retraction_eligible=retract_country,
+        town_skip_reason=town_skip,
+        country_skip_reason=country_skip,
+        **audit,
     )
+    return _with_comment(result, policy, town, code, town_removed=town_removed,
+                         country_removed=country_removed,
+                         removed_forms=tuple(removed_forms))
+
+
+def _with_comment(
+    result: RetractionResult,
+    policy: RetractionPolicy,
+    town: str,
+    code: str,
+    *,
+    town_removed: bool,
+    country_removed: bool,
+    removed_forms: tuple[str, ...],
+) -> RetractionResult:
+    """Attach the deterministic comment. Baseline wording is byte-identical."""
+    from dataclasses import replace
+
+    if policy.is_baseline:
+        text = _comment(town_removed, country_removed, town, code, removed_forms)
+    else:
+        text = _policy_comment(result, policy, town, code, town_removed, country_removed)
+    return replace(result, comment=text)
+
+
+def _policy_comment(
+    result: RetractionResult,
+    policy: RetractionPolicy,
+    town: str,
+    code: str,
+    town_removed: bool,
+    country_removed: bool,
+) -> str:
+    """Comment for a non-baseline policy: says what happened and why, per entity.
+
+    Never claims "not explicitly verified" when the real reason was a protected
+    field, a probability gate, or an overlap with the other entity's removal.
+    """
+    protected = ", ".join(result.protected_source_fields) or "none"
+    parts: list[str] = []
+
+    def _entity(label: str, value: str, removed: bool, skip: str | None,
+                probability_gate: float | None, gate_passed: bool) -> str:
+        if removed:
+            if result.protected_source_fields:
+                return (f"Retracted {label}={value} from eligible address lines; "
+                        f"occurrences in protected line(s) [{protected}] were preserved.")
+            return f"Retracted {label}={value}."
+        if skip == SKIP_NOT_VERIFIED:
+            return (f"{label} was not explicitly verified in the input, so it was "
+                    "retained only as a prediction.")
+        if skip == SKIP_PROBABILITY:
+            return (f"{label} was explicitly verified but its probability did not "
+                    f"exceed the retraction threshold {probability_gate:.2f}; "
+                    f"{label} was not retracted.")
+        if skip == SKIP_PROTECTED_ONLY:
+            return (f"{label} occurred only in protected line(s) [{protected}]; "
+                    f"{label} was not retracted.")
+        if skip == SKIP_NO_ELIGIBLE_OCCURRENCE:
+            return (f"{label} was explicitly verified but no separately retractable "
+                    f"occurrence remained; {label} was not retracted.")
+        return f"{label} was not retracted."  # pragma: no cover - defensive
+
+    parts.append(_entity("Town", town, town_removed, result.town_skip_reason,
+                         result.town_probability_gate, result.town_probability_gate_passed))
+    parts.append(_entity("Country", code or "", country_removed, result.country_skip_reason,
+                         result.country_probability_gate, result.country_probability_gate_passed))
+    return f"[{policy.name}] " + " ".join(parts)
 
 
 def _last_non_empty_field(
