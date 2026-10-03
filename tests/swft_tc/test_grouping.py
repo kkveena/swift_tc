@@ -345,7 +345,7 @@ class TestCanonicalSchemaRunsEndToEnd:
 
 
 class TestRetractionExperimentGroupConfig:
-    """The retraction-experiment configuration: one group over four lines.
+    """EXP-01 (right-most Town / all-match Country) group config: one group, four lines.
 
     A dedicated test, not a duplicate of the schema suite: this file is what
     the experiment actually loads, so its exact shape is the thing to pin.
@@ -354,7 +354,7 @@ class TestRetractionExperimentGroupConfig:
     @pytest.fixture
     def experiment_config(self, model_root):
         return load_group_config(
-            model_root / "config" / "group_config_retraction_experiment.csv"
+            model_root / "config" / "group_config_exp01_rightmost_town_allmatch_country.csv"
         )
 
     def test_exactly_one_group(self, experiment_config):
@@ -378,7 +378,7 @@ class TestRetractionExperimentGroupConfig:
 
     def test_file_carries_neither_optional_column(self, model_root):
         header = (
-            (model_root / "config" / "group_config_retraction_experiment.csv")
+            (model_root / "config" / "group_config_exp01_rightmost_town_allmatch_country.csv")
             .read_text(encoding="utf-8-sig").splitlines()[0]
         )
         assert header == (
@@ -389,11 +389,11 @@ class TestRetractionExperimentGroupConfig:
         from models.swft_tc.src.settings import load_config
 
         config = load_config(
-            model_root / "config" / "config_retraction_experiment.yaml",
+            model_root / "config" / "config_exp01_rightmost_town_allmatch_country.yaml",
             base_dir=model_root,
         )
         assert config.project.group_config_path == (
-            "config/group_config_retraction_experiment.csv"
+            "config/group_config_exp01_rightmost_town_allmatch_country.csv"
         )
         # One group, so the canonical width is the 5 input columns + 20.
         assert config.fields_per_group == 20

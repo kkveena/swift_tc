@@ -1,29 +1,53 @@
-# SWIFT Address Extraction — RETRACTION EXPERIMENT runtime configuration.
+# EXP-01 — Right-Most Town / All-Match Country Retraction Baseline
+# slug: exp01_rightmost_town_allmatch_country
 #
-# Derived from `config.yaml` (the baseline, which stays untouched). This file
-# exists so the experimental input can run through the UNCHANGED pipeline and
-# land in experiment-specific locations without overwriting baseline artifacts.
+# Experiment identity lives in this comment, the README and the analysis
+# notebook. It is NOT a config key: the settings model rejects unknown fields,
+# and adding one for cosmetic metadata would mean changing production code.
 #
+# Purpose:
+#   Establish the baseline behaviour of the current deterministic retraction
+#   algorithm before line-level or entity-aware protection experiments.
+#
+# Algorithm (unchanged production code in models/swft_tc/src/retraction.py):
+#   Town:
+#     - verified explicit evidence only (predicted_town_exists == True)
+#     - token-safe (whole-token / whole-phrase matching, never substring)
+#     - remove ONE occurrence per group: the right-most eligible standalone one
+#   Country:
+#     - verified explicit evidence only (predicted_country_exists == True)
+#     - token-safe
+#     - remove ALL eligible matching occurrences/forms (code and matched aliases)
+#   Entity-aware protection:
+#     - none
+#
+# Known baseline risk:
+#   Country terms may be removed from organisation/entity names ("CITIBANK
+#   CANADA", "NATIONAL BANK OF CANADA") because Country retraction is all-match
+#   and semantic entity boundaries are not used. Town terms inside an entity
+#   name survive only when the locality repeats the town later in the address.
+#   This cleanup does not change the algorithm; it freezes it for comparison.
+#
+# Derived from `config.yaml` (the production baseline, which stays untouched).
 # The ONLY differences from config.yaml are paths:
 #   project.group_config_path      -> one group over address_line_1..4
 #   processing.cache_path          -> own cache, so the baseline cache is not
 #                                     polluted by or reused for the experiment
 #   processing.output_path, detailed_json_path, metrics_path, errors_path
 #   reporting.reports_dir, charts_dir
+# Prompt, model runtime values, probabilities, scoring, Composite Weighted
+# Score, HITL threshold and precedence, reference data, cross-entropy and
+# retraction are byte-for-byte the baseline.
 #
-# Everything else — prompt, model, probabilities, scoring, Composite Weighted
-# Score, HITL threshold and precedence, reference data, cross-entropy,
-# retraction — is byte-for-byte the baseline. That is the point: this run
-# establishes CURRENT behaviour on problematic retraction cases before any
-# algorithm change is considered.
-#
-# Run from the repository root:
+# Run from the repository root (not part of this cleanup; the 115-record run
+# has already completed):
 #   python scripts/swft_tc/run_batch.py \
-#       --config config/config_retraction_experiment.yaml \
-#       --input  data/retraction_experiment_addresses.csv
+#       --config config/config_exp01_rightmost_town_allmatch_country.yaml \
+#       --input  data/exp01_rightmost_town_allmatch_country_addresses.csv
 #
 # No secrets belong in this file. Credentials come from environment variables
-# only (see `.env.example`).
+# only (see `.env.example`); GOOGLE_CLOUD_LOCATION and friends are environment
+# settings and are never written here.
 project:
   prompt_version: "v6-lima-postal-inference"
   record_id_column: "RECORD_ID"
@@ -31,7 +55,7 @@ project:
   # place so the prompt is never duplicated across modules.
   prompt_path: "prompts/GEMINI_EXTRACTION_PROMPT.md"
   # [EXTENSION] Group configuration file (CSV or YAML).
-  group_config_path: "config/group_config_retraction_experiment.csv"
+  group_config_path: "config/group_config_exp01_rightmost_town_allmatch_country.csv"
 
 input:
   preserve_all_columns: true
@@ -124,19 +148,19 @@ model:
 processing:
   deduplicate_addresses: true
   cache_enabled: true
-  cache_path: "outputs/retraction_experiment/address_cache.jsonl"
-  errors_path: "outputs/errors/retraction_experiment_processing_errors.csv"
-  metrics_path: "outputs/retraction_experiment_run_metrics.json"
+  cache_path: "outputs/exp01_rightmost_town_allmatch_country/address_cache.jsonl"
+  errors_path: "outputs/errors/exp01_rightmost_town_allmatch_country_processing_errors.csv"
+  metrics_path: "outputs/exp01_rightmost_town_allmatch_country_run_metrics.json"
   redact_raw_address_in_logs: true
   # [EXTENSION] Default destination for the expanded output CSV.
-  output_path: "outputs/retraction_experiment_output.csv"
+  output_path: "outputs/exp01_rightmost_town_allmatch_country_output.csv"
   # [EXTENSION] Nested per-record detail. The CSV stays the flat compatibility
   # artifact; audit and evaluation depth lives here instead of growing dozens
   # more columns. JSON Lines by default so large runs stream one record at a
   # time rather than building one huge in-memory array. Contains raw address
   # data — treat as sensitive; outputs/ is git-ignored.
   detailed_json_enabled: true
-  detailed_json_path: "outputs/retraction_experiment_detailed_output.jsonl"
+  detailed_json_path: "outputs/exp01_rightmost_town_allmatch_country_detailed_output.jsonl"
   detailed_json_format: "jsonl"     # "jsonl" (default) | "json" (small dev runs)
   detailed_json_include_empty_groups: true
 
@@ -194,8 +218,8 @@ reference_data:
 
 reporting:
   enabled: true
-  reports_dir: "outputs/retraction_experiment/reports"
-  charts_dir: "outputs/retraction_experiment/charts"
+  reports_dir: "outputs/exp01_rightmost_town_allmatch_country/reports"
+  charts_dir: "outputs/exp01_rightmost_town_allmatch_country/charts"
   executive_summary_filename: "executive_summary.json"
   score_distribution_filename: "score_distribution.csv"
   threshold_sensitivity_filename: "threshold_sensitivity.csv"
