@@ -179,6 +179,9 @@ class GeminiClient(_CountingClient):
                 "without explicit data-governance approval."
             )
 
+        #: The structured-output schema this client binds to. Subclasses bound
+        #: to a different prompt (entity identification) replace it.
+        self._response_schema: Any = RESPONSE_JSON_SCHEMA
         self._client = client if client is not None else self._build_client()
         self._config_cls, self._http_options_cls = self._load_config_types()
 
@@ -288,7 +291,7 @@ class GeminiClient(_CountingClient):
                 "temperature": self._temperature,
                 "max_output_tokens": self._max_output_tokens,
                 "response_mime_type": "application/json",
-                "response_schema": RESPONSE_JSON_SCHEMA,
+                "response_schema": self._response_schema,
             }
         kwargs: dict[str, Any] = {
             "system_instruction": self._prompt.system_instruction,
@@ -296,7 +299,7 @@ class GeminiClient(_CountingClient):
             "temperature": self._temperature,
             "max_output_tokens": self._max_output_tokens,
             "response_mime_type": "application/json",
-            "response_schema": RESPONSE_JSON_SCHEMA,
+            "response_schema": self._response_schema,
         }
         if self._http_options_cls is not None:
             kwargs["http_options"] = self._http_options_cls(

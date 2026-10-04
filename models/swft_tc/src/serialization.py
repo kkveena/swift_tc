@@ -90,6 +90,7 @@ def build_record_document(
     decisions_by_address: Mapping[str, Any],
     iso_provider: Any = None,
     include_empty_groups: bool = True,
+    entity_results: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the nested document for one input record.
 
@@ -122,6 +123,7 @@ def build_record_document(
             iso_provider=iso_provider,
             zero_is_missing=config.input.zero_field_is_missing,
             policy=RetractionPolicy.from_config(getattr(config, "retraction", None)),
+            entity_results=entity_results,
         )
 
     return {
@@ -191,11 +193,19 @@ def _group_document(
     iso_provider: Any,
     zero_is_missing: bool,
     policy: RetractionPolicy = BASELINE_POLICY,
+    entity_results: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_values = {
         field_name: str(row.get(field_name, "") or "")
         for field_name in group.source_fields
     }
+    # EXP-03: recover this instance's entity result by the same payload
+    # fingerprint the pipeline used, so the JSON protects exactly what the CSV did.
+    entity = None
+    if entity_results:
+        from .entity_detection import entity_payload_fingerprint
+
+        entity = entity_results.get(entity_payload_fingerprint(group.source_fields, source_values))
 
     town = str(column("predicted_town") or "")
     country_value = str(column("predicted_country") or "")
@@ -228,6 +238,7 @@ def _group_document(
         town_probability=town_probability,
         country_probability=country_probability,
         policy=policy,
+        protected_spans=entity.protected_spans_by_field() if entity is not None else None,
     )
     score = getattr(decision, "score", None)
     ground_truth = getattr(decision, "ground_truth", None) or null_ground_truth()
@@ -269,6 +280,7 @@ def _group_document(
             "country": str(column("rationale_country") or ""),
         },
         "retraction": retraction.to_dict(),
+        **({"entity_detection": entity.to_dict()} if entity is not None else {}),
         "hitl": _hitl_block(decision, column),
     }
     return document
@@ -322,6 +334,7 @@ def iter_record_documents(
     decisions_by_address: Mapping[str, Any],
     iso_provider: Any = None,
     include_empty_groups: bool = True,
+    entity_results: Mapping[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield one document per input row, building them lazily."""
     columns = list(frame.columns)
@@ -334,6 +347,7 @@ def iter_record_documents(
             decisions_by_address=decisions_by_address,
             iso_provider=iso_provider,
             include_empty_groups=include_empty_groups,
+            entity_results=entity_results,
         )
 
 
@@ -347,6 +361,7 @@ def write_detailed_json(
     iso_provider: Any = None,
     output_format: str = "jsonl",
     include_empty_groups: bool = True,
+    entity_results: Mapping[str, Any] | None = None,
 ) -> Path:
     """Stream the detailed output to disk. Returns the path written.
 
@@ -364,6 +379,7 @@ def write_detailed_json(
         decisions_by_address=decisions_by_address,
         iso_provider=iso_provider,
         include_empty_groups=include_empty_groups,
+        entity_results=entity_results,
     )
 
     written = 0

@@ -33,6 +33,8 @@ __all__ = [
     "ScoringConfig",
     "NULLABLE_BOOLEAN_FIELD_KEYS",
     "NULLABLE_FLOAT_FIELD_KEYS",
+    "ENTITY_FIELD_KEYS",
+    "EntityDetectionConfig",
     "MODEL_ROOT",
     "OUTPUT_FIELD_KEYS",
     "REPO_ROOT",
@@ -42,6 +44,10 @@ __all__ = [
     "dry_run_requested",
     "raw_logs_allowed",
 ]
+
+#: EXP-03 entity fields, appended after :data:`OUTPUT_FIELD_KEYS` only when
+#: ``entity_detection.enabled`` is true. Baseline experiments never emit them.
+ENTITY_FIELD_KEYS: tuple[str, ...] = ("entity_name", "entity_type", "entity_rationale")
 
 #: The output fields produced for every enabled group, in CSV order.
 #: Changing this tuple changes the per-group column count everywhere; nothing
@@ -125,6 +131,11 @@ class OutputConfig(_Base):
     country_candidate_sort: str = "alphabetical"
     templates: dict[str, str]
     legacy_templates: dict[str, str] = Field(default_factory=dict)
+    #: Column names for the EXP-03 entity fields. Used only when entity
+    #: detection is enabled; defaults follow the group_{id} convention.
+    entity_templates: dict[str, str] = Field(
+        default_factory=lambda: {key: f"{key}_group_{{id}}" for key in ENTITY_FIELD_KEYS}
+    )
 
     @field_validator("naming_style")
     @classmethod
@@ -169,6 +180,9 @@ class OutputConfig(_Base):
         return self.templates
 
     def column_name(self, field_key: str, group_id: str) -> str:
+        if field_key in ENTITY_FIELD_KEYS:
+            template = self.entity_templates.get(field_key, f"{field_key}_group_{{id}}")
+            return template.format(id=group_id)
         try:
             template = self.active_templates[field_key]
         except KeyError as exc:  # pragma: no cover - guarded by _templates_complete
@@ -402,6 +416,39 @@ class RetractionConfig(_Base):
         return self
 
 
+class EntityDetectionConfig(_Base):
+    """EXP-03 — principal entity identification for retraction protection.
+
+    Disabled by default; a config without this section produces exactly the
+    baseline CSV width and never calls the entity prompt. When enabled, a
+    SEPARATE Gemini prompt identifies the organisation/entity span(s), Python
+    re-verifies each span against the source field on token boundaries, and
+    verified spans are protected from retraction only when
+    ``entity_confidence > protection_confidence_threshold`` (strict). Entity
+    detection never touches Town/Country extraction, scoring or HITL.
+    """
+
+    enabled: bool = False
+    prompt_path: str = "prompts/GEMINI_ENTITY_PROMPT_EXP03.md"
+    prompt_version: str = "exp03-entity-identification-v1"
+    cache_enabled: bool = True
+    cache_path: str = "outputs/entity_cache.jsonl"
+    #: Strict gate on the model's own entity confidence. ``None`` = no gate.
+    protection_confidence_threshold: float | None = 0.80
+    #: Entity answers are short; a separate cap keeps the two prompts' budgets apart.
+    max_output_tokens: int = 400
+
+    @model_validator(mode="after")
+    def _validate(self) -> "EntityDetectionConfig":
+        if self.protection_confidence_threshold is not None and not (
+            0.0 <= float(self.protection_confidence_threshold) <= 1.0
+        ):
+            raise ValueError("entity_detection.protection_confidence_threshold must lie within [0, 1] or be null")
+        if self.max_output_tokens < 50:
+            raise ValueError("entity_detection.max_output_tokens must be at least 50")
+        return self
+
+
 class ScenarioWeights(_Base):
     town_weight: float
     country_weight: float
@@ -458,6 +505,8 @@ class AppConfig(_Base):
     scoring: ScoringConfig
     #: Optional. Omitted => the baseline retraction policy, unchanged.
     retraction: RetractionConfig = Field(default_factory=RetractionConfig)
+    #: Optional. Omitted => disabled: no entity prompt, no entity columns.
+    entity_detection: EntityDetectionConfig = Field(default_factory=EntityDetectionConfig)
 
     #: Directory every relative path in the config is resolved against.
     base_dir: Path = Field(default_factory=lambda: MODEL_ROOT)
@@ -468,15 +517,23 @@ class AppConfig(_Base):
         candidate = Path(relative)
         return candidate if candidate.is_absolute() else self.base_dir / candidate
 
+    @property
+    def active_field_keys(self) -> tuple[str, ...]:
+        """Output field keys in CSV order: the 20 base fields, plus the three
+        entity fields only when entity detection is enabled."""
+        if self.entity_detection.enabled:
+            return OUTPUT_FIELD_KEYS + ENTITY_FIELD_KEYS
+        return OUTPUT_FIELD_KEYS
+
     def group_column_names(self, group_id: str) -> tuple[str, ...]:
-        """The 11 output column names for one group, in CSV order."""
+        """The output column names for one group, in CSV order."""
         return tuple(
-            self.output.column_name(key, group_id) for key in OUTPUT_FIELD_KEYS
+            self.output.column_name(key, group_id) for key in self.active_field_keys
         )
 
     @property
     def fields_per_group(self) -> int:
-        return len(OUTPUT_FIELD_KEYS)
+        return len(self.active_field_keys)
 
 
 @dataclass(frozen=True)

@@ -44,6 +44,7 @@ __all__ = [
     "SKIP_NOT_VERIFIED",
     "SKIP_NO_ELIGIBLE_OCCURRENCE",
     "SKIP_PROBABILITY",
+    "SKIP_PROTECTED_ENTITY_SPAN_ONLY",
     "SKIP_PROTECTED_ONLY",
     "TokenSpan",
     "null_retraction",
@@ -66,6 +67,11 @@ SKIP_NOT_VERIFIED = "not_explicitly_verified"
 SKIP_PROBABILITY = "probability_not_above_threshold"
 SKIP_PROTECTED_ONLY = "protected_source_only"
 SKIP_NO_ELIGIBLE_OCCURRENCE = "no_eligible_occurrence"
+SKIP_PROTECTED_ENTITY_SPAN_ONLY = "protected_entity_span_only"
+
+#: Character spans, per source field, that retraction may not modify:
+#: ``{"address_line_1": ((0, 23),)}``. Produced by verified entity detection.
+ProtectedSpans = Mapping[str, Sequence[tuple[int, int]]]
 
 
 @dataclass(frozen=True)
@@ -179,6 +185,11 @@ class RetractionResult:
     country_retraction_eligible: bool = False
     town_skip_reason: str | None = None
     country_skip_reason: str | None = None
+    #: EXP-03: verified entity spans that were protected, and how many Town /
+    #: Country occurrences they shielded. Empty/zero under earlier policies.
+    protected_entity_spans: tuple[dict[str, Any], ...] = ()
+    town_occurrences_protected_by_entity: int = 0
+    country_occurrences_protected_by_entity: int = 0
 
     @property
     def changed(self) -> bool:
@@ -204,6 +215,9 @@ class RetractionResult:
             "country_retraction_eligible": self.country_retraction_eligible,
             "town_skip_reason": self.town_skip_reason,
             "country_skip_reason": self.country_skip_reason,
+            "protected_entity_spans": [dict(s) for s in self.protected_entity_spans],
+            "town_occurrences_protected_by_entity": self.town_occurrences_protected_by_entity,
+            "country_occurrences_protected_by_entity": self.country_occurrences_protected_by_entity,
         }
 
 
@@ -227,11 +241,27 @@ def token_spans(text: str) -> tuple[TokenSpan, ...]:
     return tuple(spans)
 
 
+def _excluded_token_indices(
+    spans: Sequence[TokenSpan], protected: Sequence[tuple[int, int]] | None
+) -> frozenset[int]:
+    """Token indices whose characters overlap any protected span."""
+    if not protected:
+        return frozenset()
+    excluded = set()
+    for index, span in enumerate(spans):
+        for start, end in protected:
+            if span.start < end and span.end > start:
+                excluded.add(index)
+                break
+    return frozenset(excluded)
+
+
 def token_phrase_matches(
     text: str,
     phrase: str,
     *,
     restrict_to_trailing_tokens: int | None = None,
+    protected_spans: Sequence[tuple[int, int]] | None = None,
 ) -> tuple[tuple[int, int], ...]:
     """Every standalone token-phrase occurrence of ``phrase``, in text order.
 
@@ -244,6 +274,11 @@ def token_phrase_matches(
     Exposed so a caller can decide *which* occurrence to act on before removing
     anything — the group-level Town rule needs to count occurrences across
     several fields before touching any of them.
+
+    ``protected_spans`` are character ranges of ``text`` that may not be
+    touched: a match that overlaps one is not a match. This is how a verified
+    entity span keeps its town or country word while the same word elsewhere
+    in the field stays eligible.
     """
     spans = token_spans(text or "")
     if not spans:
@@ -253,15 +288,20 @@ def token_phrase_matches(
         unicodedata.normalize("NFKC", token.text).upper()
         for token in token_spans(phrase or "")
     ]
-    return _matches(keys, needle, restrict_to_trailing_tokens)
+    return _matches(keys, needle, restrict_to_trailing_tokens,
+                    excluded=_excluded_token_indices(spans, protected_spans))
 
 
 def _matches(
     keys: Sequence[str],
     needle: Sequence[str],
     restrict_to_trailing_tokens: int | None,
+    excluded: frozenset[int] = frozenset(),
 ) -> tuple[tuple[int, int], ...]:
-    """Non-overlapping token-index matches of ``needle`` within ``keys``."""
+    """Non-overlapping token-index matches of ``needle`` within ``keys``.
+
+    A candidate match touching any ``excluded`` token index is skipped.
+    """
     if not needle or len(needle) > len(keys):
         return ()
     earliest_end = (
@@ -273,7 +313,11 @@ def _matches(
     index = 0
     while index <= len(keys) - len(needle):
         end_index = index + len(needle) - 1
-        if list(keys[index : index + len(needle)]) == list(needle) and end_index >= earliest_end:
+        if (
+            list(keys[index : index + len(needle)]) == list(needle)
+            and end_index >= earliest_end
+            and not any(i in excluded for i in range(index, end_index + 1))
+        ):
             found.append((index, end_index))
             index += len(needle)
         else:
@@ -288,6 +332,7 @@ def remove_token_phrases(
     restrict_to_trailing_tokens: int | None = None,
     max_occurrences: int | None = None,
     prefer_last: bool = False,
+    protected_spans: Sequence[tuple[int, int]] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     """Remove standalone token-phrase occurrences of each phrase.
 
@@ -329,6 +374,7 @@ def remove_token_phrases(
         return original, ()
 
     keys = [span.key for span in spans]
+    excluded = _excluded_token_indices(spans, protected_spans)
     removals: list[tuple[int, int]] = []
     removed_forms: list[str] = []
 
@@ -337,7 +383,7 @@ def remove_token_phrases(
             unicodedata.normalize("NFKC", token.text).upper()
             for token in token_spans(phrase or "")
         ]
-        found = _matches(keys, needle, restrict_to_trailing_tokens)
+        found = _matches(keys, needle, restrict_to_trailing_tokens, excluded=excluded)
         if not found:
             continue
         if max_occurrences is not None:
@@ -398,8 +444,13 @@ def retract_group(
     town_probability: float | None = None,
     country_probability: float | None = None,
     policy: RetractionPolicy = BASELINE_POLICY,
+    protected_spans: ProtectedSpans | None = None,
 ) -> RetractionResult:
     """Retract verified Town/Country evidence from one group's source columns.
+
+    ``protected_spans`` (EXP-03) are verified entity character spans per field
+    that retraction may not touch; an occurrence overlapping one is simply not
+    eligible, while the same word elsewhere stays eligible.
 
     ``source_values`` is read only — the caller's dataframe is never mutated.
     The retracted combined address is rebuilt from the after-values with
@@ -416,6 +467,15 @@ def retract_group(
     }
     protected = policy.protected_fields(source_fields)
     eligible_fields = [name for name in source_fields if name not in protected]
+    span_map: dict[str, tuple[tuple[int, int], ...]] = {
+        name: tuple((int(a), int(b)) for a, b in spans)
+        for name, spans in (protected_spans or {}).items()
+        if name in source_fields and spans
+    }
+    entity_span_records = tuple(
+        {"source_field": name, "start": a, "end": b, "text": before[name][a:b]}
+        for name, spans in span_map.items() for a, b in spans
+    )
 
     town_verified = bool(town_exists and town not in {"", NO_TOWN})
     country_codes = (
@@ -451,6 +511,7 @@ def retract_group(
         country_probability_gate=policy.country_probability_threshold,
         town_probability_gate_passed=town_gate_passed,
         country_probability_gate_passed=country_gate_passed,
+        protected_entity_spans=entity_span_records,
     )
 
     # --- Town: at most ONE occurrence per GROUP, the right-most ELIGIBLE one ---
@@ -467,6 +528,7 @@ def retract_group(
     # that protects line 1 the choice is made among the later lines only — and
     # if the Town occurs nowhere else, nothing is removed.
     town_occurrences_found = 0
+    town_occurrences_protected_by_entity = 0
     town_target_field = ""
     if town_verified:
         for field_name in source_fields:
@@ -477,12 +539,20 @@ def retract_group(
             if occurrences:
                 town_occurrences_found += occurrences
                 if field_name in eligible_fields:
-                    town_target_field = field_name
+                    unprotected = len(
+                        token_phrase_matches(value, town, protected_spans=span_map.get(field_name))
+                    )
+                    town_occurrences_protected_by_entity += occurrences - unprotected
+                    if unprotected:
+                        town_target_field = field_name
     if town_skip is None:
         if town_occurrences_found == 0:
             town_skip = SKIP_NO_ELIGIBLE_OCCURRENCE
         elif not town_target_field:
-            town_skip = SKIP_PROTECTED_ONLY
+            town_skip = (
+                SKIP_PROTECTED_ENTITY_SPAN_ONLY
+                if town_occurrences_protected_by_entity else SKIP_PROTECTED_ONLY
+            )
     retract_town = town_skip is None
 
     # --- Country forms ------------------------------------------------------
@@ -518,29 +588,37 @@ def retract_group(
     tail_field = _last_non_empty_field(before, source_fields)
     restricted_field = tail_field if tail_field in eligible_fields else ""
 
-    def _country_occurrences(fields: Sequence[str]) -> int:
+    def _country_occurrences(fields: Sequence[str], *, honour_spans: bool) -> int:
         count = 0
         for field_name in fields:
             value = before[field_name]
             if not value:
                 continue
+            spans = span_map.get(field_name) if honour_spans else None
             for form in open_forms:
-                count += len(token_phrase_matches(value, form))
+                count += len(token_phrase_matches(value, form, protected_spans=spans))
             if restricted_code and field_name == tail_field:
                 count += len(
                     token_phrase_matches(
-                        value, restricted_code, restrict_to_trailing_tokens=trailing_window
+                        value, restricted_code, restrict_to_trailing_tokens=trailing_window,
+                        protected_spans=spans,
                     )
                 )
         return count
 
+    country_occurrences_protected_by_entity = 0
     if country_skip is None:
-        found_anywhere = _country_occurrences(list(source_fields))
-        found_eligible = _country_occurrences(eligible_fields)
+        found_anywhere = _country_occurrences(list(source_fields), honour_spans=False)
+        found_eligible_fields = _country_occurrences(eligible_fields, honour_spans=False)
+        found_eligible = _country_occurrences(eligible_fields, honour_spans=True)
+        country_occurrences_protected_by_entity = found_eligible_fields - found_eligible
         if found_anywhere == 0:
             country_skip = SKIP_NO_ELIGIBLE_OCCURRENCE
         elif found_eligible == 0:
-            country_skip = SKIP_PROTECTED_ONLY
+            country_skip = (
+                SKIP_PROTECTED_ENTITY_SPAN_ONLY
+                if country_occurrences_protected_by_entity else SKIP_PROTECTED_ONLY
+            )
     retract_country = country_skip is None
 
     if not retract_town and not retract_country:
@@ -555,6 +633,8 @@ def retract_group(
             country_retraction_eligible=False,
             town_skip_reason=town_skip,
             country_skip_reason=country_skip,
+            town_occurrences_protected_by_entity=town_occurrences_protected_by_entity,
+            country_occurrences_protected_by_entity=country_occurrences_protected_by_entity,
             **audit,
         )
         return _with_comment(result, policy, town, code, town_removed=False,
@@ -588,9 +668,11 @@ def retract_group(
         # exactly as it was written rather than against a country-stripped
         # remnant. Only the one field carrying the right-most eligible
         # occurrence is touched; every earlier occurrence stays.
+        field_spans = span_map.get(field_name)
         if retract_town and field_name == town_target_field:
             updated, removed = remove_token_phrases(
-                updated, [town], max_occurrences=1, prefer_last=True
+                updated, [town], max_occurrences=1, prefer_last=True,
+                protected_spans=field_spans,
             )
             for form in removed:
                 _note(form)
@@ -599,15 +681,25 @@ def retract_group(
         # Country keeps its rule: every verified occurrence goes, since a
         # country code repeated in the text is one piece of evidence stated
         # twice, not two separate facts.
+        # Protected spans are character offsets into the ORIGINAL field value.
+        # Once the Town has been cut out the offsets no longer line up, so when a
+        # field carries both a protected span and a Town removal the Country
+        # pass re-derives the spans by text: the protected phrases are located
+        # again in the updated string.
+        country_spans = _relocate_spans(updated, before[field_name], field_spans)
         if retract_country and open_forms:
-            updated, removed = remove_token_phrases(updated, open_forms)
+            updated, removed = remove_token_phrases(
+                updated, open_forms, protected_spans=country_spans
+            )
             for form in removed:
                 _note(form)
 
         if retract_country and restricted_code and field_name == restricted_field:
+            country_spans = _relocate_spans(updated, before[field_name], field_spans)
             updated, removed = remove_token_phrases(
                 updated, [restricted_code],
                 restrict_to_trailing_tokens=trailing_window,
+                protected_spans=country_spans,
             )
             for form in removed:
                 _note(form)
@@ -644,11 +736,38 @@ def retract_group(
         country_retraction_eligible=retract_country,
         town_skip_reason=town_skip,
         country_skip_reason=country_skip,
+        town_occurrences_protected_by_entity=town_occurrences_protected_by_entity,
+        country_occurrences_protected_by_entity=country_occurrences_protected_by_entity,
         **audit,
     )
     return _with_comment(result, policy, town, code, town_removed=town_removed,
                          country_removed=country_removed,
                          removed_forms=tuple(removed_forms))
+
+
+def _relocate_spans(
+    current: str, original: str, spans: Sequence[tuple[int, int]] | None
+) -> tuple[tuple[int, int], ...] | None:
+    """Re-find protected phrases in a field whose text has already been edited.
+
+    Spans are recorded against the original field text. If nothing was removed
+    the offsets still apply; otherwise each protected phrase is located again
+    by token-safe matching in the current text (first occurrence). A phrase
+    that can no longer be found protects nothing — it was never eligible text.
+    """
+    if not spans:
+        return None
+    if current == original:
+        return tuple(spans)
+    relocated: list[tuple[int, int]] = []
+    tokens = token_spans(current)
+    for start, end in spans:
+        phrase = original[start:end]
+        matches = token_phrase_matches(current, phrase)
+        if matches:
+            first, last = matches[0]
+            relocated.append((tokens[first].start, tokens[last].end))
+    return tuple(relocated) or None
 
 
 def _with_comment(
@@ -664,7 +783,7 @@ def _with_comment(
     """Attach the deterministic comment. Baseline wording is byte-identical."""
     from dataclasses import replace
 
-    if policy.is_baseline:
+    if policy.is_baseline and not result.protected_entity_spans:
         text = _comment(town_removed, country_removed, town, code, removed_forms)
     else:
         text = _policy_comment(result, policy, town, code, town_removed, country_removed)
@@ -685,15 +804,30 @@ def _policy_comment(
     field, a probability gate, or an overlap with the other entity's removal.
     """
     protected = ", ".join(result.protected_source_fields) or "none"
+    entity_texts = ", ".join(
+        f"{s['source_field']}:'{s['text']}'" for s in result.protected_entity_spans
+    ) or "none"
     parts: list[str] = []
 
     def _entity(label: str, value: str, removed: bool, skip: str | None,
                 probability_gate: float | None, gate_passed: bool) -> str:
+        shielded = (result.town_occurrences_protected_by_entity if label == "Town"
+                    else result.country_occurrences_protected_by_entity)
         if removed:
-            if result.protected_source_fields:
+            # EXP-02 wording is preserved byte-for-byte when no entity span is
+            # involved; the entity sentence is added only when a span shielded text.
+            if result.protected_source_fields and not shielded:
                 return (f"Retracted {label}={value} from eligible address lines; "
                         f"occurrences in protected line(s) [{protected}] were preserved.")
+            if shielded:
+                extra = (f" occurrences in protected line(s) [{protected}] and"
+                         if result.protected_source_fields else "")
+                return (f"Retracted {label}={value} from eligible text;{extra} {shielded} "
+                        f"occurrence(s) inside the verified entity span [{entity_texts}] were preserved.")
             return f"Retracted {label}={value}."
+        if skip == SKIP_PROTECTED_ENTITY_SPAN_ONLY:
+            return (f"{label} occurred only inside the verified entity span [{entity_texts}]; "
+                    f"{label} was not retracted.")
         if skip == SKIP_NOT_VERIFIED:
             return (f"{label} was not explicitly verified in the input, so it was "
                     "retained only as a prediction.")

@@ -606,6 +606,64 @@ same keys appear with their baseline values, so the two runs are directly compar
 > probabilities or their `*_exists` flags between EXP-01 and EXP-02 is experiment contamination,
 > not a result; the notebook checks for it before comparing retraction.
 
+### EXP-03 — Entity-Span Protected / Confidence-Gated Retraction
+
+Slug: `exp03_entity_span_protected_confidence_gated`. A controlled **semantic** challenger to EXP-01 and
+EXP-02. EXP-02 showed that protecting line 1 wholesale prevents destructive retraction of organisation
+names — positionally. EXP-03 asks a **separate** Gemini prompt to identify the principal organisation
+or entity span itself, wherever it sits in lines 1–4, re-verifies every span deterministically, and
+protects only verified spans whose confidence is strictly above a threshold. Blanket line-1 protection
+is removed; the EXP-02 probability gates stay.
+
+| Control | EXP-03 behaviour |
+|---|---|
+| **Town/Country extraction** | unchanged and **replayed from the EXP-01/EXP-02 cache** — expected Town/Country backend calls on any EXP-03 run: 0 |
+| **Entity identification** | new prompt `models/swft_tc/prompts/GEMINI_ENTITY_PROMPT_EXP03.md` (`exp03-entity-identification-v1`), fed the **field-bounded** source lines, with its **own cache** (`…/entity_cache.jsonl`); about 115 calls on the first run, 0 on a repeat |
+| **Span verification** | each returned span must name a configured field and its text must occur there on whole-token boundaries (case-insensitive, original text kept). Anything else is rejected, recorded as rejected, and protects nothing |
+| **Confidence gate** | verified spans protect text only when `entity_confidence` **> 0.80** (`entity_detection.protection_confidence_threshold`, strict) |
+| **Retraction** | Town/Country gates `> 0.80` as in EXP-02; an occurrence overlapping a protected span is never eligible; the same word elsewhere stays eligible. Within eligible text the EXP-01 rules are unchanged |
+| **Scope of influence** | entity detection controls retraction-span eligibility **only**. It never touches Town/Country predictions, probabilities, scoring, cross-entropy or HITL, and a BANK classification forces nothing |
+
+**Taxonomy:** `BANK`, `OTHER_FINANCIAL`, `RETAIL`, `BIOTECH_HEALTHCARE`, `INDUSTRIAL_ENERGY`,
+`GOVERNMENT_PUBLIC`, `OTHER`, `NO_ENTITY`. BANK is preferred over OTHER_FINANCIAL whenever the
+organisation is a bank; an out-of-taxonomy type is normalised to OTHER with a note.
+
+**Flat CSV.** EXP-03 appends exactly three fields per group — `entity_name_group_{id}`,
+`entity_type_group_{id}`, `entity_rationale_group_{id}` — so it writes 5 + 20 + 3 = **28 columns**. The
+fields are conditional on `entity_detection.enabled`; EXP-01 and EXP-02 remain 25-column experiments
+and the production baseline keeps its 20 fields per group. Confidence, returned/verified/rejected
+spans and the protection audit (`protected_entity_spans`, `town_occurrences_protected_by_entity`,
+`country_occurrences_protected_by_entity`) live in the detailed JSON only, under `entity_detection`
+and `retraction`.
+
+| Artifact | Path |
+|---|---|
+| Runtime config | `models/swft_tc/config/config_exp03_entity_span_protected_confidence_gated.yaml` |
+| Group config / input | reused from EXP-01 |
+| Entity prompt | `models/swft_tc/prompts/GEMINI_ENTITY_PROMPT_EXP03.md` |
+| Analysis notebook | `notebooks/swft_tc/04_exp03_entity_span_protected_confidence_gated_analysis.ipynb` (EXP-01 / EXP-02 / EXP-03 side by side) |
+| Canonical output | `models/swft_tc/outputs/exp03_entity_span_protected_confidence_gated_output.csv` (+ `_detailed_output.jsonl`, `_run_metrics.json`) |
+| Caches | `models/swft_tc/outputs/exp03_entity_span_protected_confidence_gated/{address_cache.jsonl,entity_cache.jsonl}` |
+
+```bash
+mkdir -p models/swft_tc/outputs/exp03_entity_span_protected_confidence_gated
+cp models/swft_tc/outputs/exp01_rightmost_town_allmatch_country/address_cache.jsonl \
+   models/swft_tc/outputs/exp03_entity_span_protected_confidence_gated/address_cache.jsonl
+python scripts/swft_tc/run_batch.py \
+    --config config/config_exp03_entity_span_protected_confidence_gated.yaml \
+    --input  data/exp01_rightmost_town_allmatch_country_addresses.csv
+```
+
+Expect `backend calls : 0` (Town/Country) and `entity calls : ~115` on the first run, `0` on a repeat.
+As with EXP-02, a `--dry-run` keys both caches on stub model names and cannot reproduce the experiment.
+
+> **EXP-03 measures policy behaviour.** `line1_changed == 0` is *not* its success criterion — it may
+> edit line 1 where the text is not part of a verified entity span. The criterion is
+> **verified entity span changed == 0**. Any difference in Town/Country predictions, probabilities,
+> `*_exists`, composite score or HITL state versus EXP-02 is contamination, and the notebook checks
+> for it before comparing retraction.
+
+
 
 ### Threshold analytics
 

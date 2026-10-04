@@ -47,6 +47,7 @@ if __package__ in (None, ""):  # pragma: no cover - CLI bootstrap
 from models.swft_tc.src import io as swift_io  # noqa: E402
 from models.swft_tc.src import reporting  # noqa: E402
 from models.swft_tc.src.cache import AddressCache  # noqa: E402
+from models.swft_tc.src.entity_detection import build_entity_client  # noqa: E402
 from models.swft_tc.src.gemini_client import build_client  # noqa: E402
 from models.swft_tc.src.grouping import load_group_config  # noqa: E402
 from models.swft_tc.src.pipeline import Phase1Pipeline  # noqa: E402
@@ -213,6 +214,23 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("cannot start: %s", exc)
         return EXIT_CANNOT_START
 
+    # EXP-03: a separate entity prompt, client and cache when enabled.
+    entity_client = None
+    entity_cache = None
+    if config.entity_detection.enabled:
+        entity_prompt = load_prompt_contract(
+            config.path(config.entity_detection.prompt_path),
+            config.entity_detection.prompt_version,
+        )
+        entity_client = build_entity_client(
+            config.model, entity_prompt, model=model_name, dry_run=dry_run,
+            max_output_tokens=config.entity_detection.max_output_tokens,
+        )
+        entity_cache = AddressCache(
+            config.path(config.entity_detection.cache_path),
+            enabled=config.entity_detection.cache_enabled,
+        )
+
     cache = AddressCache(
         config.path(config.processing.cache_path),
         enabled=config.processing.cache_enabled,
@@ -226,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
         prompt=prompt,
         cache=cache,
         mode="dry_run" if dry_run else "live",
+        entity_client=entity_client,
+        entity_cache=entity_cache,
     )
     result = pipeline.run(frame)
 
@@ -250,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
             iso_provider=pipeline.iso_provider,
             output_format=config.processing.detailed_json_format,
             include_empty_groups=config.processing.detailed_json_include_empty_groups,
+            entity_results=result.entity_results,
         )
 
     report_paths: dict[str, Path] = {}
@@ -264,7 +285,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"model         : {model_name}")
     print(f"input         : {_describe(input_path)}  {frame.shape}")
     print(f"output        : {_describe(output_path)}  {result.frame.shape}")
-    print(f"backend calls : {client.call_count}")
+    print(f"backend calls : {client.call_count}   (Town/Country extraction)")
+    if entity_client is not None:
+        stats = result.metrics.get("efficiency", {})
+        print(f"entity calls  : {entity_client.call_count}   "
+              f"(entity identification; cache hits {stats.get('entity_cache_hits', 0)})")
     print(f"errors        : {len(result.errors)} -> {_describe(errors_path)}")
     print(f"metrics       : {_describe(metrics_path)}")
     if detail_path is not None:

@@ -63,6 +63,7 @@ from .evaluation import (
     null_cross_entropy,
     null_ground_truth,
 )
+from .entity_detection import EntityDetectionResult, EntityDetector
 from .retraction import RetractionPolicy, RetractionResult, null_retraction, retract_group
 from .scoring import (
     HitlDecision,
@@ -193,6 +194,9 @@ class RunResult:
     #: Empty instances are counted, not enumerated, so the frame stays bounded
     #: by real work rather than by rows x groups.
     instances: pd.DataFrame = field(default_factory=pd.DataFrame)
+    #: EXP-03 entity results keyed by the field-bounded payload fingerprint, so
+    #: the detailed-JSON writer can recover each row's result deterministically.
+    entity_results: dict[str, EntityDetectionResult] = field(default_factory=dict)
 
     @property
     def output_columns(self) -> int:
@@ -218,6 +222,8 @@ class Phase1Pipeline:
         cache: AddressCache | None = None,
         mode: str = "live",
         town_country_provider: TownCountryProvider | None = None,
+        entity_client: Any = None,
+        entity_cache: AddressCache | None = None,
     ) -> None:
         self.config = config
         # Eligibility policy for retraction. Absent config section => baseline.
@@ -239,6 +245,26 @@ class Phase1Pipeline:
         self._checkpoint_lock = threading.Lock()
         self._completed_since_checkpoint = 0
 
+        # EXP-03: a SEPARATE prompt, client and cache. Absent config section or
+        # enabled=False => no detector, no entity columns, nothing else changes.
+        entity_cfg = getattr(config, "entity_detection", None)
+        self.entity_detector: EntityDetector | None = None
+        if entity_cfg is not None and entity_cfg.enabled:
+            if entity_client is None:
+                raise ValueError(
+                    "entity_detection.enabled is true but no entity_client was supplied"
+                )
+            self.entity_detector = EntityDetector(
+                client=entity_client,
+                cache=entity_cache if entity_cache is not None else AddressCache(
+                    config.path(entity_cfg.cache_path), enabled=entity_cfg.cache_enabled
+                ),
+                prompt_version=entity_cfg.prompt_version,
+                protection_confidence_threshold=entity_cfg.protection_confidence_threshold,
+            )
+        self._entity_results: dict[str, EntityDetectionResult] = {}
+        self._entity_by_instance: dict[tuple[int, str], str] = {}
+
     # -- public API --------------------------------------------------------
 
     def run(
@@ -258,6 +284,7 @@ class Phase1Pipeline:
 
         outcomes, errors, usage_totals = self.run_pass2(pass1, progress=progress)
         decisions = self._decide(pass1, outcomes)
+        self._detect_entities(pass1)
         result_frame = self._write_results(pass1, decisions)
 
         swift_io.assert_columns_preserved(original_columns, list(result_frame.columns))
@@ -298,7 +325,54 @@ class Phase1Pipeline:
                 for key, item in pass1.work_items.items()
             },
             instances=_build_instance_frame(pass1, decisions),
+            entity_results=dict(self._entity_results),
         )
+
+    # -- EXP-03 entity identification ---------------------------------------
+
+    def _detect_entities(self, pass1: Pass1Result) -> None:
+        """Identify the principal entity once per unique field-bounded payload.
+
+        Runs only for non-empty instances (the ones that will be retracted) and
+        only when entity detection is enabled. Results are keyed by payload
+        fingerprint so identical field splits are detected once, and mapped to
+        each (row, group) instance for the writer.
+        """
+        if self.entity_detector is None:
+            return
+        from .entity_detection import entity_payload_fingerprint
+
+        self.entity_detector.cache.load()
+        frame = pass1.frame
+        fields_by_group = {g.group_id: g.source_fields for g in self.group_config.enabled_groups}
+        pending: list[tuple[str, str, dict[str, Any], tuple[int, str]]] = []
+        for item in pass1.work_items.values():
+            for occurrence in item.occurrences:
+                source_fields = fields_by_group[occurrence.group_id]
+                values = {
+                    name: frame.iloc[occurrence.row_index][name]
+                    for name in source_fields if name in frame.columns
+                }
+                fingerprint = entity_payload_fingerprint(source_fields, values)
+                self._entity_by_instance[(occurrence.row_index, occurrence.group_id)] = fingerprint
+                if fingerprint not in self._entity_results and all(fp != fingerprint for fp, *_ in pending):
+                    pending.append((fingerprint, occurrence.group_id, values, (occurrence.row_index, occurrence.group_id)))
+        if not pending:
+            return
+        logger.info("entity pass: %d unique field-bounded payload(s)", len(pending))
+        workers = self.config.model.effective_concurrency
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(self.entity_detector.detect, fields_by_group[gid], values): fp
+                for fp, gid, values, _ in pending
+            }
+            for future in as_completed(futures):
+                self._entity_results[futures[future]] = future.result()
+        self.entity_detector.cache.flush()
+
+    def entity_result_for(self, row_index: int, group_id: str) -> EntityDetectionResult | None:
+        fingerprint = self._entity_by_instance.get((row_index, group_id))
+        return self._entity_results.get(fingerprint) if fingerprint else None
 
     # -- pass 1 ------------------------------------------------------------
 
@@ -319,6 +393,8 @@ class Phase1Pipeline:
             group.group_id: _row_values(
                 Decision.null(self.config.scoring),
                 null_retraction(group.source_fields),
+                entity=None,
+                include_entity=self.entity_detector is not None,
             )
             for group in self.group_config.enabled_groups
         }
@@ -600,11 +676,16 @@ class Phase1Pipeline:
             for occurrence in item.occurrences:
                 # Retraction is per row/group: the same cleaned address can be
                 # split differently across source columns from one row to the next.
+                entity = self.entity_result_for(occurrence.row_index, occurrence.group_id)
                 retraction = self.retract_occurrence(
                     frame, occurrence.row_index, occurrence.group_id,
                     fields_by_group[occurrence.group_id], decision.verified,
+                    entity=entity,
                 )
-                values = _row_values(decision, retraction)
+                values = _row_values(
+                    decision, retraction, entity=entity,
+                    include_entity=self.entity_detector is not None,
+                )
                 names = self.config.group_column_names(occurrence.group_id)
                 for name, value in zip(names[2:], values):
                     updates[name][occurrence.row_index] = value
@@ -624,6 +705,7 @@ class Phase1Pipeline:
         group_id: str,
         source_fields: Sequence[str],
         verified: VerifiedExtraction,
+        entity: EntityDetectionResult | None = None,
     ) -> RetractionResult:
         """Retract one (row, group) instance from its original source columns.
 
@@ -648,6 +730,7 @@ class Phase1Pipeline:
             town_probability=float(verified.town_probability),
             country_probability=float(verified.country_probability),
             policy=self.retraction_policy,
+            protected_spans=entity.protected_spans_by_field() if entity is not None else None,
         )
 
     # -- reporting ---------------------------------------------------------
@@ -787,6 +870,7 @@ class Phase1Pipeline:
                 "cache_hits": cache_stats["hits"],
                 "cache_misses": cache_stats["misses"],
                 "backend_calls": self.client.call_count,
+                **(self.entity_detector.stats if self.entity_detector is not None else {}),
                 "token_usage": dict(usage_totals),
             },
             "outcomes": {
@@ -821,8 +905,15 @@ class Phase1Pipeline:
         }
 
 
-def _row_values(decision: Decision, retraction: RetractionResult) -> list[Any]:
-    """The post-address output values, in :data:`OUTPUT_FIELD_KEYS` order.
+def _row_values(
+    decision: Decision,
+    retraction: RetractionResult,
+    *,
+    entity: EntityDetectionResult | None = None,
+    include_entity: bool = False,
+) -> list[Any]:
+    """The post-address output values, in :data:`OUTPUT_FIELD_KEYS` order,
+    followed by the three ENTITY_FIELD_KEYS values when ``include_entity``.
 
     Length is derived from the field tuple, so adding an output field means
     editing `OUTPUT_FIELD_KEYS` and this list together and nothing else.
@@ -833,7 +924,7 @@ def _row_values(decision: Decision, retraction: RetractionResult) -> list[Any]:
     writes as a blank cell rather than a misleading zero.
     """
     verified = decision.verified
-    return [
+    values = [
         verified.town,
         verified.country_value,
         verified.country_name_value,
@@ -855,6 +946,12 @@ def _row_values(decision: Decision, retraction: RetractionResult) -> list[Any]:
         decision.hitl.state,
         decision.hitl.reason,
     ]
+    if include_entity:
+        values.extend(
+            entity.flat_values() if entity is not None
+            else EntityDetectionResult().flat_values()
+        )
+    return values
 
 
 #: Column contract of :attr:`RunResult.instances`, also used to build an empty
@@ -980,7 +1077,7 @@ def _coerce_output_dtypes(
     }
 
     for group in group_config.enabled_groups:
-        for key in OUTPUT_FIELD_KEYS:
+        for key in config.active_field_keys:
             column = config.output.column_name(key, group.group_id)
             if key in float_keys:
                 frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(float)
