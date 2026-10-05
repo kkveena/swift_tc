@@ -35,6 +35,7 @@ from .gemini_client import (
     DEFAULT_MALFORMED_RETRIES,
     GeminiClient,
     MalformedExtractionResponse,
+    TruncatedExtractionResponse,
     _CountingClient,
 )
 from .retraction import token_phrase_matches, token_spans
@@ -407,26 +408,41 @@ class EntityOutcome:
 
 
 class GeminiEntityClient(GeminiClient):
-    """The extraction client's transport and retry machinery, bound to the entity prompt and schema."""
+    """The extraction client's transport and retry machinery, bound to the entity prompt and schema.
+
+    Request shape versus the Town/Country client: same ``response_mime_type``
+    (``application/json``), the ENTITY response schema instead of the
+    Town/Country one, its own ``max_output_tokens`` budget, and the SDK's
+    client-side automatic-function-calling loop switched off explicitly. The
+    entity prompt declares no tools, so that last setting changes nothing on
+    the wire; it records the no-tools intent and silences the SDK's
+    unconditional "AFC is enabled" log line.
+    """
 
     def __init__(self, *, model: str, prompt: PromptContract, **kwargs: Any) -> None:
+        kwargs.setdefault("disable_automatic_function_calling", True)
         super().__init__(model=model, prompt=prompt, **kwargs)
         self._response_schema = ENTITY_RESPONSE_JSON_SCHEMA
+        self._schema_label = "entity"
 
     def identify(self, payload: str) -> EntityOutcome:
         attempts = 0
         last_malformed: MalformedExtractionResponse | None = None
         for malformed_attempt in range(self._malformed_retries + 1):
-            raw_text, usage, transport_attempts = self._call_with_retry(payload)
-            attempts += transport_attempts
             try:
-                response = parse_entity_response(raw_text)
+                generation, transport_attempts = self._call_with_retry(
+                    payload, attempt=malformed_attempt + 1
+                )
+                attempts += transport_attempts
+                response = self._parse_generation(generation, parse_entity_response)
+            except TruncatedExtractionResponse as exc:
+                last_malformed = exc
+                break  # same budget, same truncation: do not re-ask
             except MalformedExtractionResponse as exc:
                 last_malformed = exc
-                logger.warning("malformed entity response (attempt %d/%d): %s",
-                               malformed_attempt + 1, self._malformed_retries + 1, exc)
                 continue
-            return EntityOutcome(response=response, model=self.model, attempts=attempts, usage=usage)
+            return EntityOutcome(response=response, model=self.model, attempts=attempts,
+                                 usage=generation.usage)
         assert last_malformed is not None
         raise last_malformed
 

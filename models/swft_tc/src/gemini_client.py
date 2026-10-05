@@ -13,6 +13,7 @@ retried until the quota is gone.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -41,6 +42,8 @@ __all__ = [
     "ExtractionError",
     "ExtractionOutcome",
     "GeminiClient",
+    "GenerationDiagnostics",
+    "TruncatedExtractionResponse",
     "build_client",
     "MockExtractionClient",
     "PermanentExtractionError",
@@ -82,6 +85,67 @@ class TransientExtractionError(ExtractionError):
 
 class PermanentExtractionError(ExtractionError):
     """A failure that will not be fixed by retrying (auth, bad request, schema)."""
+
+
+class TruncatedExtractionResponse(MalformedExtractionResponse):
+    """The model stopped on ``MAX_TOKENS`` before closing its JSON object.
+
+    Distinct from an ordinary malformed response because the cause is the
+    request budget, not the model's answer: at temperature 0 an identical
+    re-ask truncates identically, so the malformed retry is skipped and the
+    error carries the finish reason and token usage instead.
+    """
+
+
+#: Finish reason reported by the SDK when ``max_output_tokens`` was exhausted.
+FINISH_REASON_MAX_TOKENS = "MAX_TOKENS"
+
+
+@dataclass(frozen=True)
+class GenerationDiagnostics:
+    """Safe-to-log facts about one model response. Carries NO address text.
+
+    Captured on every call and logged when the response fails to parse. The
+    payload is identified by a hash only; the response body is described by
+    its length and whether it opens and closes a JSON object.
+    """
+
+    payload_sha256: str
+    attempt: int
+    finish_reason: str | None
+    response_chars: int
+    starts_with_object_brace: bool
+    ends_with_object_brace: bool
+    usage: Mapping[str, Any]
+    request: Mapping[str, Any]
+
+    @property
+    def truncated(self) -> bool:
+        return self.finish_reason == FINISH_REASON_MAX_TOKENS
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "payload_sha256": self.payload_sha256,
+            "attempt": self.attempt,
+            "finish_reason": self.finish_reason,
+            "response_chars": self.response_chars,
+            "starts_with_object_brace": self.starts_with_object_brace,
+            "ends_with_object_brace": self.ends_with_object_brace,
+            "usage": dict(self.usage),
+            "request": dict(self.request),
+        }
+
+
+@dataclass(frozen=True)
+class _Generation:
+    """One raw model answer plus its diagnostics."""
+
+    text: str
+    diagnostics: GenerationDiagnostics
+
+    @property
+    def usage(self) -> Mapping[str, Any]:
+        return self.diagnostics.usage
 
 
 @dataclass(frozen=True)
@@ -155,6 +219,7 @@ class GeminiClient(_CountingClient):
         retry_jitter_seconds: float = 0.5,
         malformed_retries: int = DEFAULT_MALFORMED_RETRIES,
         enable_google_search_grounding: bool = False,
+        disable_automatic_function_calling: bool = False,
         client: Any = None,
     ) -> None:
         super().__init__()
@@ -182,8 +247,20 @@ class GeminiClient(_CountingClient):
         #: The structured-output schema this client binds to. Subclasses bound
         #: to a different prompt (entity identification) replace it.
         self._response_schema: Any = RESPONSE_JSON_SCHEMA
+        #: Short label for the bound schema, used in diagnostics only.
+        self._schema_label: str = "town_country"
+        #: When set, the SDK's client-side automatic-function-calling loop is
+        #: switched off explicitly. This pipeline declares no tools, so the
+        #: flag changes nothing on the wire (the SDK never sends it); it only
+        #: stops the SDK's unconditional "AFC is enabled" log line and makes
+        #: the no-tools intent visible in the request config.
+        self._disable_afc = bool(disable_automatic_function_calling)
         self._client = client if client is not None else self._build_client()
-        self._config_cls, self._http_options_cls = self._load_config_types()
+        (
+            self._config_cls,
+            self._http_options_cls,
+            self._afc_config_cls,
+        ) = self._load_config_types()
 
     @staticmethod
     def _build_client() -> Any:
@@ -199,12 +276,16 @@ class GeminiClient(_CountingClient):
         return genai.Client()
 
     @staticmethod
-    def _load_config_types() -> tuple[Any, Any]:
+    def _load_config_types() -> tuple[Any, Any, Any]:
         try:
             from google.genai import types
         except ImportError:  # pragma: no cover - depends on install
-            return None, None
-        return types.GenerateContentConfig, types.HttpOptions
+            return None, None, None
+        return (
+            types.GenerateContentConfig,
+            types.HttpOptions,
+            types.AutomaticFunctionCallingConfig,
+        )
 
     # -- extraction --------------------------------------------------------
 
@@ -216,38 +297,65 @@ class GeminiClient(_CountingClient):
         last_malformed: MalformedExtractionResponse | None = None
 
         for malformed_attempt in range(self._malformed_retries + 1):
-            raw_text, usage, transport_attempts = self._call_with_retry(payload)
-            attempts += transport_attempts
             try:
-                response = parse_extraction_response(raw_text)
+                generation, transport_attempts = self._call_with_retry(
+                    payload, attempt=malformed_attempt + 1
+                )
+                attempts += transport_attempts
+                response = self._parse_generation(generation, parse_extraction_response)
+            except TruncatedExtractionResponse as exc:
+                last_malformed = exc
+                break  # same budget, same truncation: do not re-ask
             except MalformedExtractionResponse as exc:
                 last_malformed = exc
-                logger.warning(
-                    "malformed structured response (attempt %d/%d): %s",
-                    malformed_attempt + 1,
-                    self._malformed_retries + 1,
-                    exc,
-                )
                 continue
             return ExtractionOutcome(
                 response=response,
                 model=self.model,
                 attempts=attempts,
-                usage=usage,
+                usage=generation.usage,
                 reference_sources=reference_context.sources,
             )
 
         assert last_malformed is not None  # loop always sets it before exhausting
         raise last_malformed
 
-    def _call_with_retry(self, payload: str) -> tuple[str, dict[str, Any], int]:
+    def _parse_generation(self, generation: _Generation, parser: Any) -> Any:
+        """Parse one answer; on failure log the safe diagnostics and re-raise.
+
+        A ``MAX_TOKENS`` finish is reported as :class:`TruncatedExtractionResponse`
+        whether or not the partial text happens to parse, because a truncated
+        structured answer is never a complete one.
+        """
+        diag = generation.diagnostics
+        if diag.truncated:
+            logger.warning(
+                "%s response truncated at max_output_tokens; diagnostics=%s",
+                self._schema_label, diag.to_dict(),
+            )
+            raise TruncatedExtractionResponse(
+                f"{self._schema_label} response hit finish_reason={diag.finish_reason} "
+                f"(max_output_tokens={self._max_output_tokens}); "
+                f"response_chars={diag.response_chars}, usage={dict(diag.usage)}"
+            )
+        try:
+            return parser(generation.text)
+        except MalformedExtractionResponse as exc:
+            logger.warning(
+                "malformed %s response (attempt %d/%d): %s; diagnostics=%s",
+                self._schema_label, diag.attempt, self._malformed_retries + 1,
+                exc, diag.to_dict(),
+            )
+            raise
+
+    def _call_with_retry(self, payload: str, *, attempt: int = 1) -> tuple[_Generation, int]:
         attempts = 0
 
-        def _attempt() -> tuple[str, dict[str, Any]]:
+        def _attempt() -> _Generation:
             nonlocal attempts
             attempts += 1
             self._record_call()
-            return self._generate(payload)
+            return self._generate(payload, attempt=attempt)
 
         retrying = Retrying(
             stop=stop_after_attempt(self._max_retries + 1),
@@ -260,12 +368,12 @@ class GeminiClient(_CountingClient):
             reraise=True,
         )
         try:
-            raw_text, usage = retrying(_attempt)
+            generation = retrying(_attempt)
         except RetryError as exc:  # pragma: no cover - reraise=True covers this
             raise TransientExtractionError(str(exc)) from exc
-        return raw_text, usage, attempts
+        return generation, attempts
 
-    def _generate(self, payload: str) -> tuple[str, dict[str, Any]]:
+    def _generate(self, payload: str, *, attempt: int = 1) -> _Generation:
         try:
             response = self._client.models.generate_content(
                 model=self.model,
@@ -278,21 +386,50 @@ class GeminiClient(_CountingClient):
             raise PermanentExtractionError(f"{type(exc).__name__}: {exc}") from exc
 
         text = getattr(response, "text", None)
+        finish_reason = _finish_reason(response)
+        usage = _usage_dict(getattr(response, "usage_metadata", None))
+        stripped = (text or "").strip()
+        diagnostics = GenerationDiagnostics(
+            payload_sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            attempt=attempt,
+            finish_reason=finish_reason,
+            response_chars=len(text or ""),
+            starts_with_object_brace=stripped.startswith("{"),
+            ends_with_object_brace=stripped.endswith("}"),
+            usage=usage,
+            request=self.request_config_summary(),
+        )
         if not text:
+            if finish_reason == FINISH_REASON_MAX_TOKENS:
+                # Nothing but thoughts fitted in the budget. Retrying the same
+                # request cannot help; report it as truncation instead.
+                logger.warning(
+                    "%s response truncated at max_output_tokens with no text; "
+                    "diagnostics=%s", self._schema_label, diagnostics.to_dict(),
+                )
+                raise TruncatedExtractionResponse(
+                    f"{self._schema_label} response hit finish_reason={finish_reason} "
+                    f"with no text (max_output_tokens={self._max_output_tokens}); "
+                    f"usage={usage}"
+                )
             # An empty body with no exception is treated as transient: it is
-            # usually a truncated or filtered generation, not a business answer.
+            # usually a filtered generation, not a business answer.
             raise TransientExtractionError("model returned an empty response body")
-        return text, _usage_dict(getattr(response, "usage_metadata", None))
+        return _Generation(text=text, diagnostics=diagnostics)
+
+    def request_config_summary(self) -> dict[str, Any]:
+        """The request settings worth auditing, with no prompt or payload text."""
+        return {
+            "model": self.model,
+            "response_mime_type": "application/json",
+            "response_schema": self._schema_label,
+            "max_output_tokens": self._max_output_tokens,
+            "temperature": self._temperature,
+            "tools": None,
+            "automatic_function_calling_disabled": self._disable_afc,
+        }
 
     def _request_config(self) -> Any:
-        if self._config_cls is None:  # pragma: no cover - depends on install
-            return {
-                "system_instruction": self._prompt.system_instruction,
-                "temperature": self._temperature,
-                "max_output_tokens": self._max_output_tokens,
-                "response_mime_type": "application/json",
-                "response_schema": self._response_schema,
-            }
         kwargs: dict[str, Any] = {
             "system_instruction": self._prompt.system_instruction,
             # Deterministic extraction: no sampling temperature, JSON only.
@@ -301,10 +438,18 @@ class GeminiClient(_CountingClient):
             "response_mime_type": "application/json",
             "response_schema": self._response_schema,
         }
+        if self._config_cls is None:  # pragma: no cover - depends on install
+            if self._disable_afc:
+                kwargs["automatic_function_calling"] = {"disable": True}
+            return kwargs
         if self._http_options_cls is not None:
             kwargs["http_options"] = self._http_options_cls(
                 timeout=int(self._timeout_seconds * 1000)
             )
+        if self._disable_afc and self._afc_config_cls is not None:
+            # No tools are declared, so this never changes the request body;
+            # it only turns off the SDK's client-side AFC loop and its log.
+            kwargs["automatic_function_calling"] = self._afc_config_cls(disable=True)
         return self._config_cls(**kwargs)
 
 
@@ -545,6 +690,9 @@ def _usage_dict(usage: Any) -> dict[str, Any]:
     fields = (
         "prompt_token_count",
         "candidates_token_count",
+        # Thinking models bill reasoning tokens against max_output_tokens;
+        # recording them is how a MAX_TOKENS finish is explained.
+        "thoughts_token_count",
         "total_token_count",
         "cached_content_token_count",
     )
@@ -553,3 +701,14 @@ def _usage_dict(usage: Any) -> dict[str, Any]:
         for name in fields
         if getattr(usage, name, None) is not None
     }
+
+
+def _finish_reason(response: Any) -> str | None:
+    """The first candidate's finish reason as a plain string, or ``None``."""
+    candidates = getattr(response, "candidates", None) or ()
+    for candidate in candidates:
+        reason = getattr(candidate, "finish_reason", None)
+        if reason is None:
+            return None
+        return str(getattr(reason, "name", None) or getattr(reason, "value", None) or reason)
+    return None

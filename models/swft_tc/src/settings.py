@@ -435,8 +435,12 @@ class EntityDetectionConfig(_Base):
     cache_path: str = "outputs/entity_cache.jsonl"
     #: Strict gate on the model's own entity confidence. ``None`` = no gate.
     protection_confidence_threshold: float | None = 0.80
-    #: Entity answers are short; a separate cap keeps the two prompts' budgets apart.
-    max_output_tokens: int = 400
+    #: Output budget for the entity call, separate from the Town/Country one.
+    #: On thinking models (gemini-2.5+/3.x) this budget is shared with the
+    #: model's reasoning tokens, so it must be far larger than the ~150-token
+    #: JSON answer: 400 produced MAX_TOKENS truncation (unterminated JSON) on
+    #: the first live EXP-03 run; 3000 completed every record.
+    max_output_tokens: int = 3000
 
     @model_validator(mode="after")
     def _validate(self) -> "EntityDetectionConfig":

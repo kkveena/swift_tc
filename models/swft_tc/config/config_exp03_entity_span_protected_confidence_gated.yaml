@@ -35,6 +35,14 @@
 #   mkdir -p outputs/exp03_entity_span_protected_confidence_gated
 #   cp outputs/exp01_rightmost_town_allmatch_country/address_cache.jsonl \
 #      outputs/exp03_entity_span_protected_confidence_gated/address_cache.jsonl
+#   # 1. five-record live smoke of the entity call path (must PASS first):
+#   python scripts/swft_tc/run_entity_smoke.py \
+#       --config config/config_exp03_entity_span_protected_confidence_gated.yaml \
+#       --input  data/exp01_rightmost_town_allmatch_country_addresses.csv \
+#       --record-ids 2152,1578,1450,1212,1062
+#   -> expect Town/Country backend calls 0, entity calls == uncached smoke
+#      records, entity errors 0, every entity response parsed
+#   # 2. the full experiment:
 #   python scripts/swft_tc/run_batch.py \
 #       --config config/config_exp03_entity_span_protected_confidence_gated.yaml \
 #       --input  data/exp01_rightmost_town_allmatch_country_addresses.csv
@@ -322,4 +330,10 @@ entity_detection:
   cache_enabled: true
   cache_path: "outputs/exp03_entity_span_protected_confidence_gated/entity_cache.jsonl"
   protection_confidence_threshold: 0.80
-  max_output_tokens: 400
+  # Output budget for the entity call. On thinking models this budget is
+  # SHARED with the model's reasoning tokens, so it must be far larger than
+  # the ~150-token JSON answer: 400 truncated (finish_reason MAX_TOKENS,
+  # unterminated JSON) on the first live run; 3000 completed every record.
+  # A truncated answer is reported as TruncatedExtractionResponse with the
+  # finish reason and token usage, never retried blindly.
+  max_output_tokens: 3000
